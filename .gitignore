@@ -3,3 +3,7 @@ __pycache__/
 .ipynb_checkpoints/
 SIP_Report_Full_Draft.md
 final_project_output.csv
+likely_to_leave_customers.csv
+summary_*.csv
+chart_*.png
+*_latest.csv

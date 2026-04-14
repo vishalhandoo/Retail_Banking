@@ -1,6 +1,6 @@
 # Retail Banking Leave-Risk Analysis
 
-This project analyzes a retail banking customer dataset to understand service-quality drivers of customer retention and identify customers who are most likely to leave. It combines SERVQUAL-based service metrics, business thresholds, and machine learning outputs to produce decision-ready CSV summaries, risk charts, and a lightweight local dashboard.
+This project analyzes a retail banking customer dataset to understand service-quality drivers of customer retention and identify customers who are most likely to leave. It combines SERVQUAL-based service metrics, business thresholds, and machine learning outputs to produce decision-ready local outputs and a lightweight dashboard.
 
 ## Project Overview
 
@@ -27,13 +27,19 @@ The workflow in this repository:
 - `retail_banking_analysis.py`: main analysis pipeline that reads the dataset, computes SERVQUAL metrics, trains the model, and exports outputs
 - `retail_banking_dashboard.py`: local dashboard server for viewing charts, summary tables, and highest-risk customers
 - `Retail_Banking_Dataset_JKBank.csv`: source dataset used for analysis
-- `final_project_output.csv`: generated locally after running the analysis; contains customer-level output with risk and recommendation fields
-- `likely_to_leave_customers.csv`: filtered list of high-risk customers
-- `summary_model_metrics.csv`: model performance summary
-- `summary_servqual_correlations.csv`: SERVQUAL-to-retention correlation results
-- `summary_feature_importance.csv`: feature importance output from the model
-- `summary_thresholds.csv`: threshold-based risk breakpoints
-- `summary_relationship_manager_effect.csv`: relationship manager comparison summary
+
+## Generated Locally
+
+These files are created when you run the analysis on your machine and are not stored in the GitHub repository:
+
+- `final_project_output.csv`
+- `likely_to_leave_customers.csv`
+- `summary_model_metrics.csv`
+- `summary_servqual_correlations.csv`
+- `summary_feature_importance.csv`
+- `summary_thresholds.csv`
+- `summary_relationship_manager_effect.csv`
+- `chart_*.png`
 
 ## How To Run
 
@@ -60,24 +66,6 @@ python retail_banking_dashboard.py
 ```text
 http://127.0.0.1:8501
 ```
-
-## Screenshots
-
-### SERVQUAL Retention Heatmap
-
-![SERVQUAL retention heatmap](chart_servqual_retention_heatmap.png)
-
-### Feature Importance
-
-![Feature importance chart](chart_servqual_feature_importance.png)
-
-### Resolution Days Leave-Risk Threshold
-
-![Resolution days leave risk chart](chart_resolution_days_leave_risk.png)
-
-### Relationship Manager Retention Comparison
-
-![Relationship manager retention chart](chart_relationship_manager_retention.png)
 
 ## Use Case
 
