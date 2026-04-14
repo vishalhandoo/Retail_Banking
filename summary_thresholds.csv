@@ -1,0 +1,3 @@
+feature,risk_direction,threshold,business_rule,risky_group_customer_count,other_group_customer_count,risky_group_leave_rate,other_group_leave_rate,risk_lift_multiple
+app_rating_score,lower,3.5,app_rating_score <= 3.5,4182,15818,0.3855,0.2142,1.7997
+resolution_days,higher,6.5,resolution_days > 6.5,5745,14255,0.6238,0.0993,6.2803
