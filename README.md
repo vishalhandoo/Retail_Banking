@@ -27,7 +27,7 @@ The workflow in this repository:
 - `retail_banking_analysis.py`: main analysis pipeline that reads the dataset, computes SERVQUAL metrics, trains the model, and exports outputs
 - `retail_banking_dashboard.py`: local dashboard server for viewing charts, summary tables, and highest-risk customers
 - `Retail_Banking_Dataset_JKBank.csv`: source dataset used for analysis
-- `final_project_output.csv`: customer-level output with risk and recommendation fields
+- `final_project_output.csv`: generated locally after running the analysis; contains customer-level output with risk and recommendation fields
 - `likely_to_leave_customers.csv`: filtered list of high-risk customers
 - `summary_model_metrics.csv`: model performance summary
 - `summary_servqual_correlations.csv`: SERVQUAL-to-retention correlation results

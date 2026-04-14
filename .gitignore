@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 SIP_Report_Full_Draft.md
+final_project_output.csv
