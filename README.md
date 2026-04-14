@@ -26,11 +26,15 @@ The workflow in this repository:
 
 - `retail_banking_analysis.py`: main analysis pipeline that reads the dataset, computes SERVQUAL metrics, trains the model, and exports outputs
 - `retail_banking_dashboard.py`: local dashboard server for viewing charts, summary tables, and highest-risk customers
-- `Retail_Banking_Dataset_JKBank.csv`: source dataset used for analysis
 
-## Generated Locally
+## Local Inputs And Outputs
 
-These files are created when you run the analysis on your machine and are not stored in the GitHub repository:
+These files are kept on your machine and are not stored in the GitHub repository:
+
+- `Retail_Banking_Dataset_JKBank.csv`
+- `Enhanced_Retail_Banking_Dataset.csv`
+
+Generated outputs created after running the analysis:
 
 - `final_project_output.csv`
 - `likely_to_leave_customers.csv`
@@ -50,6 +54,11 @@ pip install pandas numpy matplotlib seaborn scikit-learn
 ```
 
 2. Run the analysis:
+
+Make sure one of these dataset files is available in the project folder before running:
+
+- `Retail_Banking_Dataset_JKBank.csv`
+- `Enhanced_Retail_Banking_Dataset.csv`
 
 ```bash
 python retail_banking_analysis.py
