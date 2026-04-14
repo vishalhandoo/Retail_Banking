@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -17,6 +18,7 @@ DATASET_CANDIDATES = [
     "Enhanced_Retail_Banking_Dataset.csv",
     "Retail_Banking_Dataset_JKBank.csv",
 ]
+DEFAULT_EXTERNAL_DATA_DIR = BASE_DIR.parent / "Retail_Banking_PrivateData"
 FINAL_OUTPUT_FILE = BASE_DIR / "final_project_output.csv"
 MODEL_METRICS_FILE = BASE_DIR / "summary_model_metrics.csv"
 SERVQUAL_CORRELATION_FILE = BASE_DIR / "summary_servqual_correlations.csv"
@@ -59,14 +61,24 @@ CHART_FILES = {
 
 
 def locate_dataset():
-    for file_name in DATASET_CANDIDATES:
-        path = BASE_DIR / file_name
-        if path.exists():
-            return path
+    search_directories = []
+    external_data_dir = os.environ.get("RETAIL_BANKING_DATA_DIR")
+    if external_data_dir:
+        search_directories.append(Path(external_data_dir).expanduser())
+    search_directories.extend([DEFAULT_EXTERNAL_DATA_DIR, BASE_DIR])
+
+    for directory in search_directories:
+        for file_name in DATASET_CANDIDATES:
+            path = directory / file_name
+            if path.exists():
+                return path
 
     candidate_list = ", ".join(DATASET_CANDIDATES)
+    directory_list = ", ".join(str(path) for path in search_directories)
     raise FileNotFoundError(
-        f"No source dataset was found. Expected one of: {candidate_list}"
+        "No source dataset was found. "
+        f"Expected one of: {candidate_list}. "
+        f"Searched in: {directory_list}"
     )
 
 
@@ -634,7 +646,7 @@ def main():
     df = pd.read_csv(dataset_path)
     validate_columns(df)
 
-    print(f"Dataset loaded from: {dataset_path.name}")
+    print(f"Dataset loaded from: {dataset_path}")
     print(f"Shape: {df.shape}")
 
     df = build_servqual_framework(df)

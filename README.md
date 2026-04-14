@@ -34,6 +34,10 @@ These files are kept on your machine and are not stored in the GitHub repository
 - `Retail_Banking_Dataset_JKBank.csv`
 - `Enhanced_Retail_Banking_Dataset.csv`
 
+Recommended location for local dataset files:
+
+- `../Retail_Banking_PrivateData/`
+
 Generated outputs created after running the analysis:
 
 - `final_project_output.csv`
@@ -53,9 +57,15 @@ Generated outputs created after running the analysis:
 pip install pandas numpy matplotlib seaborn scikit-learn
 ```
 
-2. Run the analysis:
+2. Put the dataset in one of these locations:
 
-Make sure one of these dataset files is available in the project folder before running:
+- `../Retail_Banking_PrivateData/` from the repo folder
+- the folder pointed to by the `RETAIL_BANKING_DATA_DIR` environment variable
+- the project folder as a fallback
+
+3. Run the analysis:
+
+Make sure one of these dataset files is available:
 
 - `Retail_Banking_Dataset_JKBank.csv`
 - `Enhanced_Retail_Banking_Dataset.csv`
@@ -64,13 +74,13 @@ Make sure one of these dataset files is available in the project folder before r
 python retail_banking_analysis.py
 ```
 
-3. Start the dashboard:
+4. Start the dashboard:
 
 ```bash
 python retail_banking_dashboard.py
 ```
 
-4. Open the dashboard in your browser:
+5. Open the dashboard in your browser:
 
 ```text
 http://127.0.0.1:8501
