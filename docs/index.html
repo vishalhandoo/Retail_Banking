@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Retail Banking Customer Dashboard</title>
+  <style>
+    :root {
+      --bg: #f5efe3;
+      --panel: #fffdf8;
+      --ink: #14232d;
+      --muted: #64707a;
+      --line: rgba(20, 35, 45, 0.12);
+      --primary: #0f4c5c;
+      --secondary: #d96c06;
+      --accent: #6c8a5d;
+      --alert: #9f2f28;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      font-family: "Trebuchet MS", "Aptos", Verdana, sans-serif;
+      background: linear-gradient(180deg, #fbf6ed 0%, var(--bg) 100%);
+    }
+    .page { max-width: 1180px; margin: 0 auto; padding: 28px; }
+    .hero {
+      padding: 32px;
+      border-radius: 24px;
+      color: #fff;
+      background: linear-gradient(135deg, #143a4b 0%, #1d5567 50%, #c55e1b 120%);
+      box-shadow: 0 24px 60px rgba(20, 35, 45, 0.18);
+    }
+    h1, h2, h3 { font-family: Georgia, "Times New Roman", serif; }
+    h1 { max-width: 760px; margin: 10px 0 12px; font-size: clamp(2.2rem, 5vw, 4rem); line-height: 0.98; }
+    p { line-height: 1.65; }
+    .hero p { max-width: 760px; color: rgba(255,255,255,0.84); }
+    .tag {
+      display: block;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      font-size: 11px;
+      font-weight: 800;
+      color: rgba(255,255,255,0.72);
+    }
+    .nav, .chips, .grid { display: flex; flex-wrap: wrap; gap: 10px; }
+    .nav { margin-top: 20px; }
+    .nav a, .chip, .download {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 38px;
+      padding: 9px 13px;
+      border-radius: 999px;
+      text-decoration: none;
+      font-weight: 800;
+      font-size: 13px;
+    }
+    .nav a, .chip { color: #fff; background: rgba(255,255,255,0.13); border: 1px solid rgba(255,255,255,0.18); }
+    .panel {
+      margin-top: 18px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      background: rgba(255,253,248,0.94);
+      box-shadow: 0 14px 34px rgba(20, 35, 45, 0.06);
+    }
+    .panel h2 { margin: 0; font-size: 30px; }
+    .panel > p { color: var(--muted); margin-top: 8px; }
+    .chart-grid, .download-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+    .card {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: #fff;
+      overflow: hidden;
+    }
+    .card h3 { margin: 0 0 10px; font-size: 22px; }
+    .card p { color: var(--muted); font-size: 14px; margin: 0 0 12px; }
+    img { display: block; width: 100%; height: auto; border-radius: 14px; border: 1px solid var(--line); }
+    .download { color: #fff; background: linear-gradient(135deg, var(--primary), #1c6176); }
+    .note { border-left: 4px solid var(--secondary); }
+    @media (max-width: 720px) {
+      .page { padding: 16px; }
+      .hero, .panel { padding: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <span class="tag">Customer Retention Dashboard</span>
+      <h1>Retail Banking Customer Dashboard</h1>
+      <p>A static GitHub Pages version of the local customer-retention dashboard, with the latest exported charts and downloadable CSV summaries.</p>
+      <div class="chips">
+        <span class="chip">Service quality analysis</span>
+        <span class="chip">Leave-risk prioritization</span>
+        <span class="chip">GitHub Pages ready</span>
+      </div>
+      <nav class="nav" aria-label="Page sections">
+        <a href="#charts">Charts</a>
+        <a href="#downloads">Downloads</a>
+        <a href="#local">Local dashboard</a>
+      </nav>
+    </section>
+
+    <section class="panel note" id="local">
+      <h2>Full Interactive Dashboard</h2>
+      <p>The Python dashboard now supports static export with <code>python retail_banking_dashboard.py --export-static</code>. Run that command after regenerating analysis outputs to replace this Pages scaffold with the full multi-page static dashboard.</p>
+    </section>
+
+    <section class="panel" id="charts">
+      <h2>Charts</h2>
+      <p>Generated visual outputs from the retail banking analysis.</p>
+      <div class="chart-grid">
+        <article class="card">
+          <h3>Service experience and loyalty</h3>
+          <img src="assets/charts/chart_servqual_retention_heatmap.png" alt="Service experience and loyalty chart">
+        </article>
+        <article class="card">
+          <h3>Service score by target</h3>
+          <img src="assets/charts/chart_sqi_by_target.png" alt="Service score by target chart">
+        </article>
+        <article class="card">
+          <h3>Feature importance</h3>
+          <img src="assets/charts/chart_servqual_feature_importance.png" alt="Feature importance chart">
+        </article>
+        <article class="card">
+          <h3>App rating and leave risk</h3>
+          <img src="assets/charts/chart_app_rating_leave_risk.png" alt="App rating and leave risk chart">
+        </article>
+        <article class="card">
+          <h3>Resolution days and leave risk</h3>
+          <img src="assets/charts/chart_resolution_days_leave_risk.png" alt="Resolution days and leave risk chart">
+        </article>
+        <article class="card">
+          <h3>Relationship manager effect</h3>
+          <img src="assets/charts/chart_relationship_manager_retention.png" alt="Relationship manager retention chart">
+        </article>
+      </div>
+    </section>
+
+    <section class="panel" id="downloads">
+      <h2>Downloads</h2>
+      <p>Public-safe summary CSV exports copied from the latest local analysis run. Customer-level files stay local.</p>
+      <div class="download-grid">
+        <article class="card"><h3>Model Metrics</h3><a class="download" href="assets/downloads/summary_model_metrics.csv">Download CSV</a></article>
+        <article class="card"><h3>Retention KPIs</h3><a class="download" href="assets/downloads/summary_retention_kpis.csv">Download CSV</a></article>
+        <article class="card"><h3>Thresholds</h3><a class="download" href="assets/downloads/summary_thresholds.csv">Download CSV</a></article>
+        <article class="card"><h3>Feature Importance</h3><a class="download" href="assets/downloads/summary_feature_importance.csv">Download CSV</a></article>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,0 +1,16 @@
+framework_view,segment_label,subsegment_label,customer_count,avg_predicted_leave_probability,avg_risk_adjusted_retention_score,avg_clv,avg_service_quality_index,relationship_manager_coverage_rate,credit_review_required_rate
+Retention Strategy Lane,Proactive Retention,Early Warning,3979,0.2945,15.8791,215687.3194,0.4666,0.2581,0.4396
+Retention Strategy Lane,Proactive Retention,Lifecycle Engagement,9999,0.0304,1.8032,308479.7063,0.5992,0.3728,0.2138
+Retention Strategy Lane,Reactive Retention,Early Warning,2021,0.6075,31.1443,195503.312,0.4242,0.2187,0.7857
+Retention Strategy Lane,Reactive Retention,Immediate Trigger,1001,0.9706,38.0306,122080.9761,0.3003,0.1528,0.9331
+Retention Strategy Lane,Reactive Retention,Priority Watchlist,3000,0.8429,40.2596,182523.3729,0.3806,0.2247,0.8187
+CLV And Risk Segment,Grow And Deepen,Low Risk,3662,0.2439,21.5274,89277.9811,0.5465,0.0956,0.0
+CLV And Risk Segment,Monitor And Stabilize,High Risk,3724,0.5625,16.752,90676.0968,0.3652,0.0994,1.0
+CLV And Risk Segment,Monitor And Stabilize,Moderate Risk,2614,0.4085,24.5119,90582.6791,0.4498,0.1002,0.4055
+CLV And Risk Segment,Protect And Grow,Low Risk,3626,0.0862,7.5287,404901.4099,0.6598,0.4975,0.0
+CLV And Risk Segment,Strategic Review,High Risk,3584,0.361,10.5902,414731.1086,0.4633,0.5112,1.0
+CLV And Risk Segment,Strategic Review,Moderate Risk,2790,0.1939,11.6334,412769.934,0.5583,0.5039,0.1781
+RARS Priority Segment,Immediate Retention Priority,All,1002,0.8511,68.5149,115719.4123,0.4189,0.1517,0.2415
+RARS Priority Segment,Monitor,All,10000,0.0384,1.5423,313327.6602,0.5919,0.3822,0.28
+RARS Priority Segment,Priority Retention,All,2998,0.7549,39.755,170476.0897,0.3975,0.1915,0.7882
+RARS Priority Segment,Selective Retention,All,6000,0.4505,16.6239,207879.8378,0.4363,0.246,0.5767

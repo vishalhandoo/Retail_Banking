@@ -9,3 +9,5 @@ chart_*.png
 *_latest.csv
 Retail_Banking_Dataset_JKBank.csv
 Enhanced_Retail_Banking_Dataset.csv
+!docs/
+!docs/**

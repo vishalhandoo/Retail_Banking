@@ -86,6 +86,25 @@ python retail_banking_dashboard.py
 http://127.0.0.1:8501
 ```
 
+## GitHub Pages
+
+GitHub Pages serves static files, so export the dashboard before publishing:
+
+```bash
+python retail_banking_dashboard.py --export-static
+```
+
+This writes the site to `docs/`, including:
+
+- `index.html`
+- one HTML file for each dashboard page
+- chart images under `docs/assets/charts/`
+- public-safe summary CSV downloads under `docs/assets/downloads/`
+
+Customer-level exports such as `final_project_output.csv` and `likely_to_leave_customers.csv` are intentionally kept out of the static GitHub Pages export.
+
+Commit the generated `docs/` folder and push to `main`. The included GitHub Actions workflow publishes `docs/` to GitHub Pages automatically.
+
 ## Use Case
 
 This project is useful for:

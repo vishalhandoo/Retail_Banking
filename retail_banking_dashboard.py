@@ -1,10 +1,11 @@
 import argparse
 import html
+import shutil
 from http import HTTPStatus
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import numpy as np
 import pandas as pd
@@ -87,6 +88,11 @@ DOWNLOAD_FILES = {
     "summary_credit_risk_integration.csv": CREDIT_RISK_INTEGRATION_FILE,
     "likely_to_leave_customers.csv": HIGH_RISK_CUSTOMERS_FILE,
 }
+PUBLIC_DOWNLOAD_FILES = {
+    file_name: path
+    for file_name, path in DOWNLOAD_FILES.items()
+    if file_name not in {"final_project_output.csv", "likely_to_leave_customers.csv"}
+}
 PUBLIC_FILE_ROUTES = {
     **{f"/downloads/{name}": path for name, path in DOWNLOAD_FILES.items()},
     **{f"/charts/{name}": BASE_DIR / name for name in CHART_FILES},
@@ -134,6 +140,19 @@ PLAIN_KPI_DETAILS = {
     "five_plus_products_rate": "Customers with deeper relationships across the bank.",
     "proactive_retention_share": "Customers being managed early, before issues become urgent.",
 }
+PAGE_CONFIG = [
+    ("overview", "Overview", "Snapshot of customer volume, service quality, and risk."),
+    ("health", "Health Check", "Portfolio checkpoints and KPI definitions."),
+    ("drivers", "Key Issues", "Warning signs that appear to push risk higher."),
+    ("charts", "Charts", "Visual diagnostics behind the main findings."),
+    ("actions", "Action List", "Customers to review first."),
+    ("details", "Details", "Analyst tables and supporting exports."),
+    ("downloads", "Files", "Latest generated CSV downloads."),
+]
+PAGE_LABELS = {page_id: label for page_id, label, _ in PAGE_CONFIG}
+PAGE_ROUTES = {"/": "overview", "/dashboard": "overview"}
+PAGE_ROUTES.update({f"/{page_id}": page_id for page_id, _, _ in PAGE_CONFIG})
+STATIC_EXPORT_DIR = BASE_DIR / "docs"
 
 
 def load_csv(path):
@@ -233,6 +252,46 @@ def plain_kpi_detail(metric_name, fallback_detail):
 def get_filter_value(params, key):
     value = params.get(key, ["All"])[0]
     return value if value else "All"
+
+
+def normalize_page(page_id):
+    return page_id if page_id in PAGE_LABELS else "overview"
+
+
+def build_page_url(page_id, params, static_site=False):
+    if static_site:
+        return "index.html" if page_id == "overview" else f"{page_id}.html"
+
+    filtered_params = {}
+    for key, values in params.items():
+        if key == "page":
+            continue
+        if not values:
+            continue
+        value = values[0]
+        if value not in ("", "All"):
+            filtered_params[key] = value
+
+    query = urlencode(filtered_params)
+    path = "/" if page_id == "overview" else f"/{page_id}"
+    return f"{path}?{query}" if query else path
+
+
+def build_page_nav(active_page, params, static_site=False):
+    links = []
+    active_page = normalize_page(active_page)
+    for page_id, label, detail in PAGE_CONFIG:
+        active_class = " page-link-active" if page_id == active_page else ""
+        page_url = build_page_url(page_id, params, static_site)
+        links.append(
+            f"""
+            <a class="page-link{active_class}" href="{html.escape(page_url)}">
+                <span>{html.escape(label)}</span>
+                <small>{html.escape(detail)}</small>
+            </a>
+            """
+        )
+    return f'<nav class="page-nav" aria-label="Dashboard pages">{"".join(links)}</nav>'
 
 
 def build_select(name, selected_value, options):
@@ -365,14 +424,15 @@ def summarize_portfolio(filtered_df):
     }
 
 
-def chart_html(file_name, cache_key):
+def chart_html(file_name, cache_key, static_site=False):
     chart_path = resolve_output_path(BASE_DIR / file_name)
     if not chart_path.exists():
         return (
             '<div class="empty-state">Chart not found. Run '
             '<code>python retail_banking_analysis.py</code> to regenerate outputs.</div>'
         )
-    return f'<img src="/charts/{file_name}?v={cache_key}" alt="{html.escape(chart_path.stem.replace("_", " ").title())}">'
+    src = f"assets/charts/{file_name}" if static_site else f"/charts/{file_name}?v={cache_key}"
+    return f'<img src="{html.escape(src)}" alt="{html.escape(chart_path.stem.replace("_", " ").title())}">'
 
 
 def risk_tone(segment):
@@ -429,7 +489,7 @@ def build_signal_card(title, metric, detail, tone="neutral"):
     """
 
 
-def build_chart_card(chart_config, cache_key):
+def build_chart_card(chart_config, cache_key, static_site=False):
     return f"""
     <article class="chart-card">
         <div class="chart-copy">
@@ -437,12 +497,12 @@ def build_chart_card(chart_config, cache_key):
             <h3>{html.escape(chart_config['title'])}</h3>
             <p>{html.escape(chart_config['description'])}</p>
         </div>
-        <div class="chart-frame">{chart_html(chart_config['file'], cache_key)}</div>
+        <div class="chart-frame">{chart_html(chart_config['file'], cache_key, static_site)}</div>
     </article>
     """
 
 
-def build_download_card(file_name):
+def build_download_card(file_name, static_site=False):
     descriptions = {
         "final_project_output.csv": "Main customer-level file used by this dashboard.",
         "summary_model_metrics.csv": "Simple summary of how the estimate was built and checked.",
@@ -459,7 +519,7 @@ def build_download_card(file_name):
         <span class="section-tag">Export</span>
         <h3>{html.escape(title)}</h3>
         <p>{html.escape(descriptions.get(file_name, 'Latest generated dashboard export.'))}</p>
-        <a class="download-link" href="/downloads/{html.escape(file_name)}">Download CSV</a>
+        <a class="download-link" href="{html.escape('assets/downloads/' + file_name if static_site else '/downloads/' + file_name)}">Download CSV</a>
     </article>
     """
 
@@ -701,6 +761,40 @@ def build_dashboard_css():
         flex-wrap: wrap;
         gap: 10px;
     }
+    .page-nav {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 10px;
+        margin-top: 18px;
+    }
+    .page-link {
+        min-height: 82px;
+        padding: 12px;
+        border-radius: 16px;
+        border: 1px solid rgba(255,255,255,0.18);
+        background: rgba(255,255,255,0.11);
+        color: #fff;
+        text-decoration: none;
+        transition: background 0.18s ease, transform 0.18s ease, border-color 0.18s ease;
+    }
+    .page-link span {
+        display: block;
+        font-weight: 900;
+        line-height: 1.2;
+    }
+    .page-link small {
+        display: block;
+        margin-top: 7px;
+        color: rgba(255,255,255,0.72);
+        font-size: 11px;
+        line-height: 1.35;
+    }
+    .page-link:hover, .page-link-active {
+        transform: translateY(-2px);
+        background: rgba(255,255,255,0.22);
+        border-color: rgba(255,255,255,0.36);
+    }
+    .page-link-active small { color: rgba(255,255,255,0.88); }
     .hero-panel, .panel, .table-card, .download-card, .metric-card, .signal-card, .chart-card {
         border: 1px solid var(--line);
         border-radius: 22px;
@@ -746,6 +840,16 @@ def build_dashboard_css():
         margin-top: 18px;
         padding: 22px;
         box-shadow: 0 14px 34px rgba(20, 35, 45, 0.06);
+    }
+    .dashboard-section { display: none; }
+    .page-overview .dashboard-section-overview,
+    .page-health .dashboard-section-health,
+    .page-drivers .dashboard-section-drivers,
+    .page-charts .dashboard-section-charts,
+    .page-actions .dashboard-section-actions,
+    .page-details .dashboard-section-details,
+    .page-downloads .dashboard-section-downloads {
+        display: block;
     }
     .toolbar {
         position: sticky;
@@ -981,6 +1085,90 @@ def build_dashboard_css():
             font-weight: 700;
         }
     }
+    /* === INTERACTIONS & ANIMATIONS === */
+    .metric-card, .signal-card, .chart-card, .download-card {
+        transition: transform 0.22s ease, box-shadow 0.22s ease;
+    }
+    .metric-card:hover, .signal-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 24px 48px rgba(20, 35, 45, 0.14);
+    }
+    .chart-card:hover, .download-card:hover {
+        transform: translateY(-3px);
+        box-shadow: 0 18px 36px rgba(20, 35, 45, 0.11);
+    }
+    @keyframes _slideUp {
+        from { opacity: 0; transform: translateY(14px); }
+        to   { opacity: 1; transform: translateY(0); }
+    }
+    .metric-grid .metric-card { animation: _slideUp 0.45s ease both; }
+    .metric-grid .metric-card:nth-child(1)  { animation-delay: 0.05s; }
+    .metric-grid .metric-card:nth-child(2)  { animation-delay: 0.10s; }
+    .metric-grid .metric-card:nth-child(3)  { animation-delay: 0.15s; }
+    .metric-grid .metric-card:nth-child(4)  { animation-delay: 0.20s; }
+    .metric-grid .metric-card:nth-child(5)  { animation-delay: 0.25s; }
+    .metric-grid .metric-card:nth-child(6)  { animation-delay: 0.30s; }
+    .metric-grid .metric-card:nth-child(7)  { animation-delay: 0.35s; }
+    .metric-grid .metric-card:nth-child(8)  { animation-delay: 0.40s; }
+    .metric-grid .metric-card:nth-child(9)  { animation-delay: 0.45s; }
+    .metric-grid .metric-card:nth-child(10) { animation-delay: 0.50s; }
+    .metric-grid .metric-card:nth-child(11) { animation-delay: 0.55s; }
+    .signal-grid .signal-card { animation: _slideUp 0.45s ease both; }
+    .signal-grid .signal-card:nth-child(1) { animation-delay: 0.05s; }
+    .signal-grid .signal-card:nth-child(2) { animation-delay: 0.12s; }
+    .signal-grid .signal-card:nth-child(3) { animation-delay: 0.19s; }
+    .signal-grid .signal-card:nth-child(4) { animation-delay: 0.26s; }
+    .signal-grid .signal-card:nth-child(5) { animation-delay: 0.33s; }
+    .signal-grid .signal-card:nth-child(6) { animation-delay: 0.40s; }
+    @keyframes _critPulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(159, 47, 40, 0); }
+        50%       { box-shadow: 0 0 0 8px rgba(159, 47, 40, 0.16); }
+    }
+    .metric-critical, .signal-critical {
+        animation: _critPulse 2.6s ease-in-out infinite, _slideUp 0.45s ease both;
+    }
+    .button, .download-link {
+        transition: transform 0.18s ease, box-shadow 0.18s ease, filter 0.18s ease;
+    }
+    .button-primary:hover, .download-link:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 22px rgba(15, 76, 92, 0.30);
+        filter: brightness(1.08);
+    }
+    .button-secondary:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 14px rgba(20, 35, 45, 0.10);
+    }
+    .jump-link { transition: background 0.18s ease, transform 0.18s ease; }
+    .jump-link:hover { background: rgba(255,255,255,0.22); transform: translateY(-2px); }
+    .spotlight-card { transition: background 0.20s ease, transform 0.20s ease; }
+    .spotlight-card:hover { background: rgba(255,255,255,0.20); transform: translateY(-2px); }
+    .action-table tbody tr { transition: background 0.14s ease; }
+    .action-table tbody tr:hover { background: rgba(15, 76, 92, 0.05); }
+    @keyframes _barGrow {
+        from { transform: scaleX(0); }
+        to   { transform: scaleX(1); }
+    }
+    .mix-segment { transform-origin: left center; animation: _barGrow 1.1s cubic-bezier(0.22,1,0.36,1) both; }
+    .mix-segment:nth-child(1) { animation-delay: 0.10s; }
+    .mix-segment:nth-child(2) { animation-delay: 0.30s; }
+    .mix-segment:nth-child(3) { animation-delay: 0.50s; }
+    .mix-segment:nth-child(4) { animation-delay: 0.70s; }
+    @keyframes _livePulse {
+        0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(74,222,128,0.7); }
+        50%       { opacity: 0.7; box-shadow: 0 0 0 5px rgba(74,222,128,0); }
+    }
+    .live-dot {
+        display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+        background: #4ade80; margin-right: 5px; vertical-align: middle;
+        animation: _livePulse 1.8s ease-in-out infinite;
+    }
+    .hero-chip { transition: background 0.18s ease; }
+    .hero-chip:hover { background: rgba(255,255,255,0.20); }
+    .filter select:focus, .filter input:focus { outline: 2px solid var(--primary); outline-offset: 2px; }
+    .download-link::before { content: "↓  "; font-weight: 900; }
+    .risk-pill, .coverage-pill { transition: transform 0.15s ease; }
+    .risk-pill:hover, .coverage-pill:hover { transform: scale(1.06); }
     """
     replacements = {
         "__COLOR_SURFACE__": COLOR_SURFACE,
@@ -993,6 +1181,65 @@ def build_dashboard_css():
     for token, value in replacements.items():
         css = css.replace(token, value)
     return css
+
+
+def build_dashboard_js():
+    return """
+(function(){
+    function countUp(el){
+        if(el.dataset.counted) return;
+        el.dataset.counted='1';
+        var raw=el.textContent.trim();
+        var m=raw.match(/^([\d,]+(?:\.\d+)?)(\s*%|\s*[^%\d].*)?\s*$/);
+        if(!m) return;
+        var numStr=m[1].replace(/,/g,'');
+        var suffix=m[2]||'';
+        var target=parseFloat(numStr);
+        if(isNaN(target)||target<=0) return;
+        var decimals=(numStr.split('.')[1]||'').length;
+        var hasComma=m[1].indexOf(',')>=0;
+        var dur=900, t0=null;
+        function step(ts){
+            if(!t0) t0=ts;
+            var p=Math.min((ts-t0)/dur,1);
+            var ease=1-Math.pow(1-p,3);
+            var val=ease*target;
+            var str=val.toFixed(decimals);
+            if(hasComma&&val>=1000) str=str.replace(/\\B(?=(\\d{3})+(?!\\d))/g,',');
+            el.textContent=str+suffix;
+            if(p<1) requestAnimationFrame(step);
+        }
+        requestAnimationFrame(step);
+    }
+    function revealOnScroll(){
+        var panels=document.querySelectorAll('.panel:not(.toolbar)');
+        if(!('IntersectionObserver' in window)){
+            panels.forEach(function(p){p.style.opacity='1';p.style.transform='none';});
+            return;
+        }
+        var io=new IntersectionObserver(function(entries){
+            entries.forEach(function(e){
+                if(e.isIntersecting){
+                    e.target.style.opacity='1';
+                    e.target.style.transform='none';
+                    io.unobserve(e.target);
+                    e.target.querySelectorAll('.metric-value').forEach(countUp);
+                }
+            });
+        },{threshold:0.06});
+        panels.forEach(function(p){
+            p.style.opacity='0';
+            p.style.transform='translateY(18px)';
+            p.style.transition='opacity 0.55s ease, transform 0.55s ease';
+            io.observe(p);
+        });
+    }
+    document.addEventListener('DOMContentLoaded',function(){
+        document.querySelectorAll('.spotlight-value').forEach(countUp);
+        revealOnScroll();
+    });
+})();
+"""
 
 
 def build_waiting_html(refresh_seconds):
@@ -1026,7 +1273,8 @@ def build_waiting_html(refresh_seconds):
     """
 
 
-def build_dashboard_html(params):
+def build_dashboard_html(params, active_page="overview", static_site=False):
+    active_page = normalize_page(active_page)
     try:
         refresh_seconds = max(5, int(params.get("refresh", ["300"])[0]))
     except (TypeError, ValueError):
@@ -1124,12 +1372,21 @@ def build_dashboard_html(params):
         )
 
     chart_cards_html = "".join(
-        build_chart_card(chart_config, cache_key) for chart_config in CHART_CONFIG
+        build_chart_card(chart_config, cache_key, static_site)
+        for chart_config in CHART_CONFIG
     )
     retention_kpi_cards_html = build_retention_kpi_cards(retention_kpi_df)
+    download_files = PUBLIC_DOWNLOAD_FILES if static_site else DOWNLOAD_FILES
     download_cards_html = "".join(
-        build_download_card(file_name) for file_name in DOWNLOAD_FILES
+        build_download_card(file_name, static_site) for file_name in download_files
     )
+    page_nav_html = build_page_nav(active_page, params, static_site)
+    current_page_path = (
+        build_page_url(active_page, params, static_site)
+        if static_site
+        else ("/" if active_page == "overview" else f"/{active_page}")
+    )
+    reset_page_url = current_page_path
     support_tables_html = "".join(
         [
             f"""
@@ -1192,7 +1449,7 @@ def build_dashboard_html(params):
         <title>Retail Banking Customer Dashboard</title>
         <style>{build_dashboard_css()}</style>
     </head>
-    <body>
+    <body class="page-{html.escape(active_page)}">
         <div class="page">
             <section class="hero">
                 <div class="hero-copy">
@@ -1201,21 +1458,14 @@ def build_dashboard_html(params):
                     <p>This page highlights which customers may need follow-up, what service issues are hurting the relationship, and who should be contacted first.</p>
                     <p><strong>How the estimate works:</strong> {target_note}</p>
                     <div class="hero-meta">
-                        <span class="hero-chip">Last update: {get_last_updated()}</span>
+                        <span class="hero-chip"><span class="live-dot"></span>Last update: {get_last_updated()}</span>
                         <span class="hero-chip">Customers loaded: {format_number(metrics['rows_loaded'])}</span>
                         <span class="hero-chip">Customers shown: {format_number(portfolio_summary['customers'])}</span>
                         <span class="hero-chip">Need attention soon: {format_number(portfolio_summary['high_risk_customers'])}</span>
                         <span class="hero-chip">Average chance of leaving: {format_percent(portfolio_summary['avg_leave_probability'], 1)}</span>
                         <span class="hero-chip">Average priority score: {format_number(portfolio_summary['avg_risk_adjusted_retention_score'], 2)}</span>
                     </div>
-                    <div class="jump-links">
-                        <a class="jump-link" href="#overview">Overview</a>
-                        <a class="jump-link" href="#benchmarks">Health Check</a>
-                        <a class="jump-link" href="#drivers">Key Issues</a>
-                        <a class="jump-link" href="#diagnostics">Charts</a>
-                        <a class="jump-link" href="#actions">Action List</a>
-                        <a class="jump-link" href="#downloads">Files</a>
-                    </div>
+                    {page_nav_html}
                 </div>
                 <aside class="hero-panel">
                     <span class="section-tag">Current View</span>
@@ -1246,7 +1496,7 @@ def build_dashboard_html(params):
                     </div>
                     <div class="panel-note">The page refreshes automatically when the latest export files change.</div>
                 </div>
-                <form method="get">
+                <form method="get" action="{html.escape(current_page_path)}">
                     <div class="filters">
                         {build_select("loan_type", get_filter_value(params, "loan_type"), loan_options)}
                         {build_select("leave_risk_segment", get_filter_value(params, "leave_risk_segment"), risk_options)}
@@ -1257,14 +1507,14 @@ def build_dashboard_html(params):
                         </label>
                         <div class="filter-actions">
                             <button class="button button-primary" type="submit">Apply Filters</button>
-                            <a class="button button-secondary" href="/">Show All</a>
+                            <a class="button button-secondary" href="{html.escape(reset_page_url)}">Show All</a>
                         </div>
                     </div>
                 </form>
                 <div class="context-pills">{build_filter_context(params, refresh_seconds)}</div>
             </section>
 
-            <section class="panel" id="overview">
+            <section class="panel dashboard-section dashboard-section-overview" id="overview">
                 <div class="panel-head">
                     <div>
                         <span class="panel-label">Quick Summary</span>
@@ -1296,7 +1546,7 @@ def build_dashboard_html(params):
                 </div>
             </section>
 
-            <section class="panel" id="benchmarks">
+            <section class="panel dashboard-section dashboard-section-health" id="benchmarks">
                 <div class="panel-head">
                     <div>
                         <span class="panel-label">Health Check</span>
@@ -1316,7 +1566,7 @@ def build_dashboard_html(params):
                 </div>
             </section>
 
-            <section class="panel" id="drivers">
+            <section class="panel dashboard-section dashboard-section-drivers" id="drivers">
                 <div class="panel-head">
                     <div>
                         <span class="panel-label">Key Issues</span>
@@ -1335,7 +1585,7 @@ def build_dashboard_html(params):
                 </div>
             </section>
 
-            <section class="panel" id="diagnostics">
+            <section class="panel dashboard-section dashboard-section-charts" id="diagnostics">
                 <div class="panel-head">
                     <div>
                         <span class="panel-label">Charts</span>
@@ -1346,7 +1596,7 @@ def build_dashboard_html(params):
                 <div class="chart-grid">{chart_cards_html}</div>
             </section>
 
-            <section class="panel" id="actions">
+            <section class="panel dashboard-section dashboard-section-actions" id="actions">
                 <div class="panel-head">
                     <div>
                         <span class="panel-label">Action List</span>
@@ -1364,7 +1614,7 @@ def build_dashboard_html(params):
                 <div class="table-wrap">{build_action_table(top_customers)}</div>
             </section>
 
-            <section class="panel">
+            <section class="panel dashboard-section dashboard-section-details" id="details">
                 <div class="panel-head">
                     <div>
                         <span class="panel-label">Detailed Tables</span>
@@ -1375,7 +1625,7 @@ def build_dashboard_html(params):
                 <div class="support-grid">{support_tables_html}</div>
             </section>
 
-            <section class="panel" id="downloads">
+            <section class="panel dashboard-section dashboard-section-downloads" id="downloads">
                 <div class="panel-head">
                     <div>
                         <span class="panel-label">Downloads</span>
@@ -1386,6 +1636,7 @@ def build_dashboard_html(params):
                 <div class="download-grid">{download_cards_html}</div>
             </section>
         </div>
+        <script>{build_dashboard_js()}</script>
     </body>
     </html>
     """
@@ -1394,9 +1645,10 @@ def build_dashboard_html(params):
 class DashboardHandler(SimpleHTTPRequestHandler):
     def _handle_request(self, include_body):
         parsed = urlparse(self.path)
-        if parsed.path in ("/", "/dashboard"):
+        active_page = PAGE_ROUTES.get(parsed.path)
+        if active_page is not None:
             params = parse_qs(parsed.query)
-            html_content = build_dashboard_html(params).encode("utf-8")
+            html_content = build_dashboard_html(params, active_page).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(html_content)))
@@ -1439,9 +1691,55 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self._handle_request(include_body=False)
 
 
+def copy_static_asset(source_path, destination_path):
+    resolved_source = resolve_output_path(source_path)
+    if not resolved_source.exists():
+        return False
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(resolved_source, destination_path)
+    return True
+
+
+def export_static_site(output_dir=STATIC_EXPORT_DIR):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / ".nojekyll").write_text("", encoding="utf-8")
+
+    exported_pages = []
+    for page_id, _, _ in PAGE_CONFIG:
+        file_name = "index.html" if page_id == "overview" else f"{page_id}.html"
+        page_html = build_dashboard_html({}, page_id, static_site=True)
+        (output_dir / file_name).write_text(page_html, encoding="utf-8")
+        exported_pages.append(file_name)
+
+    copied_assets = []
+    for file_name in CHART_FILES:
+        destination = output_dir / "assets" / "charts" / file_name
+        if copy_static_asset(BASE_DIR / file_name, destination):
+            copied_assets.append(destination.relative_to(output_dir).as_posix())
+
+    for file_name, source_path in PUBLIC_DOWNLOAD_FILES.items():
+        destination = output_dir / "assets" / "downloads" / file_name
+        if copy_static_asset(source_path, destination):
+            copied_assets.append(destination.relative_to(output_dir).as_posix())
+
+    print(f"Exported GitHub Pages site to {output_dir}")
+    print(f"Pages: {', '.join(exported_pages)}")
+    print(f"Assets copied: {len(copied_assets)}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run the retail banking customer dashboard."
+    )
+    parser.add_argument(
+        "--export-static",
+        action="store_true",
+        help="Write a static GitHub Pages site to the docs folder.",
+    )
+    parser.add_argument(
+        "--static-dir",
+        default=str(STATIC_EXPORT_DIR),
+        help="Output folder for --export-static.",
     )
     parser.add_argument(
         "--host", default="127.0.0.1", help="Host to bind the dashboard server to."
@@ -1450,6 +1748,10 @@ def main():
         "--port", type=int, default=8501, help="Port to bind the dashboard server to."
     )
     args = parser.parse_args()
+
+    if args.export_static:
+        export_static_site(Path(args.static_dir))
+        return
 
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     print(f"Dashboard running at http://{args.host}:{args.port}")
