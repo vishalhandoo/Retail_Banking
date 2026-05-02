@@ -1,11 +1,15 @@
 import argparse
 import html
+import json
+import os
 import shutil
 from http import HTTPStatus
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
@@ -22,6 +26,19 @@ RETENTION_KPI_FILE = BASE_DIR / "summary_retention_kpis.csv"
 RETENTION_FRAMEWORK_FILE = BASE_DIR / "summary_customer_retention_framework.csv"
 CREDIT_RISK_INTEGRATION_FILE = BASE_DIR / "summary_credit_risk_integration.csv"
 HIGH_RISK_CUSTOMERS_FILE = BASE_DIR / "likely_to_leave_customers.csv"
+REPORT_FILE = BASE_DIR / "SIP_Report_Full_Draft.md"
+ENV_FILE = BASE_DIR / ".env"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+CHATBOT_HISTORY_LIMIT = 6
+CHATBOT_EXAMPLE_PROMPTS = [
+    "Why are customers likely to leave in this portfolio?",
+    "Which factors most affect retention and why?",
+    "What operational improvements should be prioritized first?",
+    "Which customers need urgent intervention right now?",
+    "What does the complaint-resolution chart mean?",
+    "How can the bank improve retention rate based on this dashboard?",
+]
 CHART_CONFIG = [
     {
         "file": "chart_servqual_retention_heatmap.png",
@@ -70,6 +87,13 @@ SERVQUAL_DIMENSION_COLUMNS = [
     "servqual_empathy",
     "servqual_tangibles",
 ]
+SERVQUAL_LABELS = {
+    "servqual_reliability": "Reliability",
+    "servqual_responsiveness": "Responsiveness",
+    "servqual_assurance": "Assurance",
+    "servqual_empathy": "Personal care",
+    "servqual_tangibles": "Digital experience",
+}
 
 COLOR_PRIMARY = "#0f4c5c"
 COLOR_SECONDARY = "#d96c06"
@@ -146,6 +170,7 @@ PAGE_CONFIG = [
     ("drivers", "Key Issues", "Warning signs that appear to push risk higher."),
     ("charts", "Charts", "Visual diagnostics behind the main findings."),
     ("actions", "Action List", "Customers to review first."),
+    ("copilot", "Decipher AI", "Ask grounded questions about the dashboard findings."),
     ("details", "Details", "Analyst tables and supporting exports."),
     ("downloads", "Files", "Latest generated CSV downloads."),
 ]
@@ -223,11 +248,42 @@ def format_percent(value, decimals=2):
     return f"{value * 100:.{decimals}f}%"
 
 
+def format_currency(value):
+    numeric_value = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric_value):
+        return "NA"
+    return f"Rs {numeric_value:,.0f}"
+
+
 def format_label(value):
     if pd.isna(value):
         return "NA"
     text = str(value)
     return DISPLAY_LABELS.get(text, text.replace("servqual_", "").replace("_", " ").title())
+
+
+def safe_numeric(value):
+    return pd.to_numeric(value, errors="coerce")
+
+
+def safe_flag_state(value):
+    numeric_value = safe_numeric(value)
+    if pd.isna(numeric_value):
+        return None
+    return bool(numeric_value == 1)
+
+
+def safe_flag(value):
+    return safe_flag_state(value) is True
+
+
+def format_flag_status(value):
+    state = safe_flag_state(value)
+    if state is True:
+        return "Yes"
+    if state is False:
+        return "No"
+    return "NA"
 
 
 def plain_target_note(target_strategy, fallback_note):
@@ -344,6 +400,29 @@ def filter_dataframe(df, params):
     return filtered
 
 
+def sort_priority_customers(df):
+    if df.empty:
+        return df
+
+    sort_columns = [
+        column
+        for column in [
+            "risk_adjusted_retention_score",
+            "predicted_leave_probability",
+            "clv",
+        ]
+        if column in df.columns
+    ]
+    if not sort_columns:
+        return df
+
+    return df.sort_values(
+        sort_columns,
+        ascending=[False] * len(sort_columns),
+        na_position="last",
+    )
+
+
 def ensure_dashboard_columns(df):
     if df.empty:
         return df
@@ -421,6 +500,454 @@ def summarize_portfolio(filtered_df):
         "weakest_dimension": dimension_mean.index[0],
         "strongest_dimension": dimension_mean.index[-1],
         "dominant_high_risk_loan_type": dominant_loan_type,
+    }
+
+
+def load_local_env_file():
+    if not ENV_FILE.exists():
+        return
+
+    for raw_line in ENV_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+
+        if value.startswith(("'", '"')) and value.endswith(("'", '"')) and len(value) >= 2:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+load_local_env_file()
+
+
+def get_gemini_api_key():
+    return os.environ.get("GEMINI_API_KEY", "").strip()
+
+
+def get_gemini_model():
+    return os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+
+
+def build_filter_summary(params):
+    labels = []
+    for key in ["loan_type", "leave_risk_segment", "relationship_manager"]:
+        value = get_filter_value(params, key)
+        if value != "All":
+            labels.append(f"{format_label(key)}: {format_label(value)}")
+    return ", ".join(labels) if labels else "All customers in the dashboard"
+
+
+def load_report_excerpt():
+    resolved_path = resolve_output_path(REPORT_FILE)
+    if not resolved_path.exists():
+        return ""
+
+    report_text = resolved_path.read_text(encoding="utf-8", errors="ignore")
+    start_marker = "## 4. Executive Summary"
+    end_marker = "## 5. Body"
+    start_index = report_text.find(start_marker)
+    end_index = report_text.find(end_marker)
+    if start_index != -1 and end_index != -1 and end_index > start_index:
+        report_text = report_text[start_index:end_index]
+    report_text = " ".join(report_text.split())
+    return report_text[:2500]
+
+
+def build_top_urgent_customer_lines(filtered_df, threshold_df):
+    if filtered_df.empty:
+        return ["No customer rows are available for the current filter."]
+
+    resolution_threshold = get_threshold_record(threshold_df, "resolution_days")
+    app_threshold = get_threshold_record(threshold_df, "app_rating_score")
+    resolution_cutoff = (
+        pd.to_numeric(resolution_threshold.get("threshold"), errors="coerce")
+        if resolution_threshold is not None
+        else np.nan
+    )
+    app_cutoff = (
+        pd.to_numeric(app_threshold.get("threshold"), errors="coerce")
+        if app_threshold is not None
+        else np.nan
+    )
+
+    top_rows = sort_priority_customers(filtered_df).head(5)
+    lines = []
+    for _, row in top_rows.iterrows():
+        reasons = []
+        resolution_days = pd.to_numeric(row.get("resolution_days"), errors="coerce")
+        app_rating = pd.to_numeric(row.get("app_rating_score"), errors="coerce")
+        if pd.notna(resolution_cutoff) and pd.notna(resolution_days) and resolution_days > resolution_cutoff:
+            reasons.append(
+                f"complaint resolution is above the {format_number(resolution_cutoff, 1)} day threshold"
+            )
+        if pd.notna(app_cutoff) and pd.notna(app_rating) and app_rating <= app_cutoff:
+            reasons.append(
+                f"app rating is at or below the {format_number(app_cutoff, 1)} warning point"
+            )
+        if safe_flag_state(row.get("has_relationship_manager")) is False:
+            reasons.append("no relationship manager is assigned")
+        if not reasons:
+            reasons.append("overall priority score and predicted leave probability are both elevated")
+
+        lines.append(
+            "Customer {customer_id}: {segment}, leave probability {leave_prob}, priority score {priority}, "
+            "loan type {loan_type}, recommended action {action}, reasons: {reasons}.".format(
+                customer_id=row.get("customer_id", "NA"),
+                segment=format_label(row.get("leave_risk_segment", "NA")),
+                leave_prob=format_percent(row.get("predicted_leave_probability"), 1),
+                priority=format_number(row.get("risk_adjusted_retention_score"), 2),
+                loan_type=row.get("loan_type", "NA"),
+                action=row.get("recommended_action", "Review account"),
+                reasons="; ".join(reasons),
+            )
+        )
+    return lines
+
+
+def build_dashboard_context(data, filtered_df, params, active_page):
+    metrics_df = data["metrics"]
+    if filtered_df.empty or metrics_df.empty:
+        return "Dashboard context is unavailable because the required analysis files are missing."
+
+    metrics = metrics_df.iloc[0]
+    portfolio_summary = summarize_portfolio(filtered_df)
+    threshold_df = data["thresholds"].copy()
+    relationship_manager_df = data["relationship_manager"].copy()
+    retention_kpi_df = data["retention_kpis"].copy()
+    feature_importance_df = data["feature_importance"].copy()
+    correlations_df = data["correlations"].copy()
+    retention_framework_df = data["retention_framework"].copy()
+    credit_risk_integration_df = data["credit_risk_integration"].copy()
+
+    threshold_lines = []
+    for _, row in threshold_df.iterrows():
+        threshold_lines.append(
+            "{feature}: {direction} risk threshold at {threshold}; risky group leave rate {risky_rate}; "
+            "other group leave rate {other_rate}; lift {lift}x.".format(
+                feature=row.get("feature", "NA"),
+                direction=row.get("risk_direction", "NA"),
+                threshold=row.get("threshold", "NA"),
+                risky_rate=format_percent(pd.to_numeric(row.get("risky_group_leave_rate"), errors="coerce"), 1),
+                other_rate=format_percent(pd.to_numeric(row.get("other_group_leave_rate"), errors="coerce"), 1),
+                lift=format_number(pd.to_numeric(row.get("risk_lift_multiple"), errors="coerce"), 2),
+            )
+        )
+
+    relationship_lines = []
+    for _, row in relationship_manager_df.iterrows():
+        relationship_lines.append(
+            "{status}: customer count {count}, avg predicted leave probability {leave_prob}, "
+            "retention proxy {retention}, avg service quality {service_quality}.".format(
+                status=row.get("relationship_manager_status", "NA"),
+                count=format_number(pd.to_numeric(row.get("customer_count"), errors="coerce")),
+                leave_prob=format_percent(pd.to_numeric(row.get("avg_predicted_leave_probability"), errors="coerce"), 1),
+                retention=format_percent(pd.to_numeric(row.get("retention_rate_proxy"), errors="coerce"), 1),
+                service_quality=format_percent(pd.to_numeric(row.get("avg_service_quality_index"), errors="coerce"), 1),
+            )
+        )
+
+    kpi_lines = []
+    for _, row in retention_kpi_df.iterrows():
+        kpi_lines.append(
+            "{label}: {value}. Interpretation: {meaning}".format(
+                label=row.get("metric_label", row.get("metric_name", "NA")),
+                value=format_kpi_value(row.get("metric_value"), row.get("unit")),
+                meaning=plain_kpi_detail(row.get("metric_name"), str(row.get("interpretation", ""))),
+            )
+        )
+
+    feature_lines = []
+    for _, row in feature_importance_df.head(5).iterrows():
+        feature_lines.append(
+            f"{format_label(row.get('feature', 'NA'))}: importance {format_number(pd.to_numeric(row.get('importance'), errors='coerce'), 3)}"
+        )
+
+    correlation_lines = []
+    for _, row in correlations_df.head(5).iterrows():
+        correlation_lines.append(
+            f"{format_label(row.get('servqual_dimension', 'NA'))}: correlation with retention score {format_number(pd.to_numeric(row.get('correlation_with_retention_score'), errors='coerce'), 3)}"
+        )
+
+    framework_lines = []
+    for _, row in retention_framework_df.head(6).iterrows():
+        framework_lines.append(
+            "{segment}: {subsegment}, customers {count}, avg leave probability {leave_prob}, RM coverage {rm_coverage}.".format(
+                segment=row.get("segment_label", "NA"),
+                subsegment=row.get("subsegment_label", "NA"),
+                count=format_number(pd.to_numeric(row.get("customer_count"), errors="coerce")),
+                leave_prob=format_percent(pd.to_numeric(row.get("avg_predicted_leave_probability"), errors="coerce"), 1),
+                rm_coverage=format_percent(pd.to_numeric(row.get("relationship_manager_coverage_rate"), errors="coerce"), 1),
+            )
+        )
+
+    credit_lines = []
+    for _, row in credit_risk_integration_df.head(5).iterrows():
+        credit_lines.append(
+            "{band}: avg leave probability {leave_prob}, credit review required {credit_review}, reactive retention rate {reactive_rate}.".format(
+                band=row.get("risk_band", "NA"),
+                leave_prob=format_percent(pd.to_numeric(row.get("avg_predicted_leave_probability"), errors="coerce"), 1),
+                credit_review=format_percent(pd.to_numeric(row.get("credit_review_required_rate"), errors="coerce"), 1),
+                reactive_rate=format_percent(pd.to_numeric(row.get("reactive_retention_rate"), errors="coerce"), 1),
+            )
+        )
+
+    chart_lines = [
+        f"{item['title']}: {item['description']}"
+        for item in CHART_CONFIG
+    ]
+
+    current_view_lines = [
+        f"Active page: {PAGE_LABELS.get(active_page, active_page)}.",
+        f"Current filter scope: {build_filter_summary(params)}.",
+        f"Customers shown: {format_number(portfolio_summary['customers'])}.",
+        f"High and critical risk customers: {format_number(portfolio_summary['high_risk_customers'])} ({format_percent(portfolio_summary['high_risk_share'], 1)}).",
+        f"Critical customers: {format_number(portfolio_summary['critical_customers'])}.",
+        f"Average predicted leave probability: {format_percent(portfolio_summary['avg_leave_probability'], 1)}.",
+        f"Average risk-adjusted retention score: {format_number(portfolio_summary['avg_risk_adjusted_retention_score'], 2)}.",
+        f"Average app rating: {format_number(portfolio_summary['avg_app_rating_score'], 2)}.",
+        f"Average complaint resolution days: {format_number(portfolio_summary['avg_resolution_days'], 2)}.",
+        f"Relationship-manager coverage in this view: {format_percent(portfolio_summary['relationship_manager_coverage'], 1)}.",
+        f"Weakest service dimension in this view: {format_label(portfolio_summary['weakest_dimension'])}.",
+        f"Strongest service dimension in this view: {format_label(portfolio_summary['strongest_dimension'])}.",
+        f"Loan type with the most urgent cases: {portfolio_summary['dominant_high_risk_loan_type']}.",
+        f"Higher-risk customers without a relationship manager: {format_number(portfolio_summary['priority_without_rm'])}.",
+        f"Customers needing approval before credit-related offers: {format_number(portfolio_summary['credit_review_required_customers'])}.",
+    ]
+
+    report_excerpt = load_report_excerpt()
+
+    context_sections = [
+        "PROJECT SUMMARY",
+        f"Dataset rows loaded: {format_number(metrics.get('rows_loaded'))}.",
+        f"Target strategy: {plain_target_note(str(metrics.get('target_strategy', '')), str(metrics.get('target_note', '')))}",
+        f"Model performance: accuracy {format_percent(pd.to_numeric(metrics.get('accuracy'), errors='coerce'), 2)}, precision {format_percent(pd.to_numeric(metrics.get('precision'), errors='coerce'), 2)}, recall {format_percent(pd.to_numeric(metrics.get('recall'), errors='coerce'), 2)}.",
+        f"Strongest SERVQUAL driver in the model: {format_label(metrics.get('strongest_servqual_dimension', 'NA'))}.",
+        "",
+        "CURRENT DASHBOARD VIEW",
+        *current_view_lines,
+        "",
+        "RETENTION KPI SUMMARY",
+        *kpi_lines,
+        "",
+        "TOP FEATURE IMPORTANCE DRIVERS",
+        *feature_lines,
+        "",
+        "SERVQUAL CORRELATIONS WITH RETENTION",
+        *correlation_lines,
+        "",
+        "KEY OPERATIONAL THRESHOLDS",
+        *threshold_lines,
+        "",
+        "RELATIONSHIP MANAGER EFFECT",
+        *relationship_lines,
+        "",
+        "RETENTION FRAMEWORK SNAPSHOT",
+        *framework_lines,
+        "",
+        "CREDIT-RISK INTEGRATION SNAPSHOT",
+        *credit_lines,
+        "",
+        "CHART GUIDE",
+        *chart_lines,
+        "",
+        "TOP URGENT CUSTOMERS IN THE CURRENT VIEW",
+        *build_top_urgent_customer_lines(filtered_df, threshold_df),
+    ]
+    if report_excerpt:
+        context_sections.extend(["", "REPORT EXECUTIVE SUMMARY EXCERPT", report_excerpt])
+
+    return "\n".join(str(item) for item in context_sections if item is not None)
+
+
+def build_chatbot_system_prompt():
+    return """
+You are Decipher AI, the dashboard assistant for a retail banking retention and leave-risk dashboard.
+Your audience is the dashboard handler, faculty reviewer, or manager, not end customers.
+
+Always follow these rules:
+- Ground every answer in the dashboard context provided with the request.
+- Do not invent metrics, counts, thresholds, or causal claims that are not supported by the provided context.
+- If the data needed for a direct answer is unavailable, say that clearly and then give a best-practice recommendation.
+- Use simple business language, not technical jargon.
+- Be concise, clear, and action-oriented.
+- When possible, explain the answer using the project's observed findings:
+  complaint-resolution days above threshold are strongly associated with higher leave risk;
+  lower app ratings are associated with higher leave risk;
+  relationship-manager coverage improves retention outcomes;
+  responsiveness, reliability, and assurance are major drivers.
+- Prefer recommendations such as improving complaint resolution time, improving app experience,
+  improving responsiveness and reliability, targeting high-risk customers, and expanding relationship-manager
+  support where it is useful.
+- If you need to refer to yourself by name, use Decipher AI.
+- Never describe yourself as a generic chatbot.
+
+Use this response structure and complete every section:
+Insight:
+Why it matters:
+Recommended action:
+
+Keep answers complete and practical. Prefer 120-220 words unless the user asks for more detail.
+""".strip()
+
+
+def normalize_chat_history(history):
+    cleaned_history = []
+    if not isinstance(history, list):
+        return cleaned_history
+
+    for item in history[-CHATBOT_HISTORY_LIMIT:]:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = str(item.get("content", "")).strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        cleaned_history.append({"role": role, "content": content[:3000]})
+    return cleaned_history
+
+
+def extract_gemini_text(response_payload):
+    candidates = response_payload.get("candidates") or []
+    complete_texts = []
+    partial_texts = []
+    for candidate in candidates:
+        content = candidate.get("content") or {}
+        parts = content.get("parts") or []
+        text_parts = [part.get("text", "") for part in parts if isinstance(part, dict)]
+        combined = "".join(text_parts).strip()
+        if combined:
+            finish_reason = str(candidate.get("finishReason", ""))
+            if finish_reason == "MAX_TOKENS":
+                partial_texts.append(combined)
+            else:
+                complete_texts.append(combined)
+
+    if complete_texts:
+        return max(complete_texts, key=len)
+    if partial_texts:
+        longest_partial = max(partial_texts, key=len)
+        return (
+            longest_partial.rstrip()
+            + "\n\nRecommended action:\nAsk the question again with a narrower scope if you need a longer version; "
+            "the model response reached its output limit."
+        )
+
+    prompt_feedback = response_payload.get("promptFeedback") or {}
+    block_reason = prompt_feedback.get("blockReason")
+    if block_reason:
+        return (
+            "Insight:\nThe assistant could not answer because the model blocked this request.\n\n"
+            "Why it matters:\nThis usually happens when the API did not return a usable completion.\n\n"
+            "Recommended action:\nRephrase the question more specifically around the dashboard findings and try again."
+        )
+    return ""
+
+
+def ask_gemini_dashboard_assistant(question, dashboard_context, history=None):
+    api_key = get_gemini_api_key()
+    if not api_key:
+        return {
+            "ok": False,
+            "status": HTTPStatus.SERVICE_UNAVAILABLE,
+            "message": (
+                "Decipher AI is not configured yet because `GEMINI_API_KEY` is missing. "
+                "Add the environment variable, restart the dashboard, and try again."
+            ),
+        }
+
+    model_name = get_gemini_model()
+    conversation_contents = []
+    for item in normalize_chat_history(history):
+        conversation_contents.append(
+            {
+                "role": "model" if item["role"] == "assistant" else "user",
+                "parts": [{"text": item["content"]}],
+            }
+        )
+
+    user_prompt = (
+        "Use the dashboard context below to answer the user's question.\n\n"
+        f"{dashboard_context}\n\n"
+        f"USER QUESTION:\n{question.strip()}"
+    )
+    conversation_contents.append({"role": "user", "parts": [{"text": user_prompt}]})
+    payload = {
+        "systemInstruction": {"parts": [{"text": build_chatbot_system_prompt()}]},
+        "contents": conversation_contents,
+        "generationConfig": {
+            "temperature": 0.25,
+            "topP": 0.9,
+            "maxOutputTokens": 1800,
+        },
+    }
+
+    request = Request(
+        GEMINI_API_URL.format(model=model_name),
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="ignore")
+        error_message = "The Gemini API returned an error."
+        if error_body:
+            try:
+                parsed_error = json.loads(error_body)
+                error_message = (
+                    parsed_error.get("error", {}).get("message")
+                    or error_message
+                )
+            except json.JSONDecodeError:
+                error_message = error_body[:500]
+        return {
+            "ok": False,
+            "status": exc.code,
+            "message": f"Decipher AI could not answer right now: {error_message}",
+        }
+    except URLError as exc:
+        return {
+            "ok": False,
+            "status": HTTPStatus.BAD_GATEWAY,
+            "message": (
+                "Decipher AI could not reach the Gemini API. Check internet access, firewall settings, "
+                "and your API key configuration, then try again."
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "status": HTTPStatus.INTERNAL_SERVER_ERROR,
+            "message": f"Decipher AI hit an unexpected error: {exc}",
+        }
+
+    answer_text = extract_gemini_text(response_payload)
+    if not answer_text:
+        return {
+            "ok": False,
+            "status": HTTPStatus.BAD_GATEWAY,
+            "message": (
+                "Decipher AI did not receive a usable answer from Gemini. "
+                "Please try a more specific dashboard question."
+            ),
+        }
+
+    return {
+        "ok": True,
+        "status": HTTPStatus.OK,
+        "message": answer_text,
+        "model": model_name,
     }
 
 
@@ -547,6 +1074,187 @@ def build_risk_mix_bar(filtered_df):
     return f'<div class="mix-bar">{"".join(segments)}</div><div class="mix-legend">{"".join(legend)}</div>'
 
 
+def build_driver_chips(customer):
+    chips = []
+    credit_review_required = safe_flag_state(customer.get("credit_review_required"))
+    has_relationship_manager = safe_flag_state(customer.get("has_relationship_manager"))
+    complaint_count = safe_numeric(customer.get("complaint_count"))
+    app_rating = safe_numeric(customer.get("app_rating_score"))
+    resolution_days = safe_numeric(customer.get("resolution_days"))
+    credit_score = safe_numeric(customer.get("credit_score"))
+    service_quality = safe_numeric(customer.get("service_quality_index"))
+
+    if credit_review_required is True:
+        chips.append("Credit review required before offers")
+    if has_relationship_manager is False:
+        chips.append("No RM assigned")
+    if pd.notna(complaint_count) and complaint_count > 0:
+        chips.append(f"{format_number(complaint_count)} complaint(s) recorded")
+    if pd.notna(resolution_days) and resolution_days >= 7:
+        chips.append("Slow complaint resolution")
+    if pd.notna(app_rating) and app_rating <= 3:
+        chips.append("Weak app rating")
+    if pd.notna(service_quality) and service_quality < 0.45:
+        chips.append("Low service quality")
+    if pd.notna(credit_score) and credit_score < 600:
+        chips.append("Weak credit score")
+
+    return chips or ["Review relationship and confirm current concern"]
+
+
+def build_frontline_guidance(customer):
+    focus_points = []
+    safe_offers = []
+    avoid_offers = []
+
+    risk_label = str(customer.get("leave_risk_segment", "NA"))
+    service_quality = safe_numeric(customer.get("service_quality_index"))
+    resolution_days = safe_numeric(customer.get("resolution_days"))
+    complaint_count = safe_numeric(customer.get("complaint_count"))
+    app_rating = safe_numeric(customer.get("app_rating_score"))
+    credit_score = safe_numeric(customer.get("credit_score"))
+    product_count = safe_numeric(customer.get("product_count"))
+    has_relationship_manager = safe_flag_state(customer.get("has_relationship_manager"))
+    credit_review_required = safe_flag_state(customer.get("credit_review_required"))
+    loan_type = str(customer.get("loan_type", "loan relationship")).strip() or "loan relationship"
+
+    if risk_label == "Critical":
+        focus_points.append("Contact the customer the same working day and confirm ownership.")
+    if has_relationship_manager is False:
+        focus_points.append("Assign a named RM or branch owner before discussing offers.")
+    if (pd.notna(complaint_count) and complaint_count > 0) or (pd.notna(resolution_days) and resolution_days >= 7):
+        focus_points.append("Start with service recovery and close any complaint loop first.")
+    if pd.notna(app_rating) and app_rating <= 3:
+        focus_points.append("Offer digital banking support for app, login, alerts, or payment friction.")
+    if pd.notna(service_quality) and service_quality < 0.45:
+        focus_points.append("Repair reliability and responsiveness before any product conversation.")
+    if credit_review_required is True or (pd.notna(credit_score) and credit_score < 600):
+        focus_points.append("Avoid aggressive credit offers until credit review is cleared.")
+    if pd.notna(product_count) and product_count >= 5:
+        focus_points.append("Protect the wider relationship and check whether one product is creating dissatisfaction.")
+
+    safe_offers.extend(
+        [
+            "Service recovery callback with a committed owner.",
+            "EMI date alignment or payment assistance discussion if policy allows.",
+            "Digital banking support for app, alerts, login, and payment setup.",
+            "Auto-pay setup to reduce repayment friction.",
+        ]
+    )
+
+    if credit_review_required is True or (pd.notna(credit_score) and credit_score < 600):
+        safe_offers.append("Account servicing and repayment support before any new credit discussion.")
+        avoid_offers.extend(
+            [
+                "Fresh unsecured lending while credit profile is weak or under review.",
+                "Aggressive top-up or cross-sell before credit review is complete.",
+            ]
+        )
+    else:
+        safe_offers.append("Rate review or tenure optimization if the customer is eligible.")
+        safe_offers.append("Relevant bundled products only after service issues are resolved.")
+
+    if "personal" in loan_type.lower():
+        avoid_offers.append("Extra unsecured exposure unless affordability is clearly healthy.")
+
+    avoid_offers.append("Generic product pitching before trust is repaired.")
+
+    if not focus_points:
+        focus_points.append("Start with a relationship review and confirm the customer's immediate concern.")
+
+    return {
+        "primary_focus": focus_points[0],
+        "focus_points": focus_points[:6],
+        "safe_offers": list(dict.fromkeys(safe_offers))[:6],
+        "avoid_offers": list(dict.fromkeys(avoid_offers))[:4],
+    }
+
+
+def build_customer_ai_context(customer):
+    guidance = build_frontline_guidance(customer)
+    service_lines = [
+        f"{SERVQUAL_LABELS[column]}: {format_number(safe_numeric(customer.get(column)), 2)}"
+        for column in SERVQUAL_DIMENSION_COLUMNS
+    ]
+    return "\n".join(
+        [
+            "CUSTOMER 360 CONTEXT",
+            f"Customer ID: {customer.get('customer_id', 'NA')}",
+            f"Risk segment: {customer.get('leave_risk_segment', 'NA')}",
+            f"Predicted leave probability: {format_percent(safe_numeric(customer.get('predicted_leave_probability')), 1)}",
+            f"Retention score: {format_number(safe_numeric(customer.get('retention_score')), 2)}",
+            f"Service quality index: {format_number(safe_numeric(customer.get('service_quality_index')), 2)}",
+            f"App rating: {format_number(safe_numeric(customer.get('app_rating_score')), 1)}",
+            f"Complaint count: {format_number(safe_numeric(customer.get('complaint_count')), 0)}",
+            f"Resolution days: {format_number(safe_numeric(customer.get('resolution_days')), 1)}",
+            f"Credit score: {format_number(safe_numeric(customer.get('credit_score')), 0)}",
+            f"Product count: {format_number(safe_numeric(customer.get('product_count')), 0)}",
+            f"Relationship manager assigned: {format_flag_status(customer.get('has_relationship_manager'))}",
+            f"Credit review required: {format_flag_status(customer.get('credit_review_required'))}",
+            "",
+            "SERVICE DIAGNOSTICS",
+            *service_lines,
+            "",
+            "FRONTLINE GUIDANCE",
+            f"Primary focus: {guidance['primary_focus']}",
+            "RM next steps: " + "; ".join(guidance["focus_points"]),
+            "Safe offers/support: " + "; ".join(guidance["safe_offers"]),
+            "Avoid: " + "; ".join(guidance["avoid_offers"]),
+        ]
+    )
+
+
+def build_customer_360_payload(frame):
+    payload = {}
+    for _, customer in frame.head(15).iterrows():
+        customer_id = str(customer.get("customer_id", "NA"))
+        risk_label = str(customer.get("leave_risk_segment", "NA"))
+        guidance = build_frontline_guidance(customer)
+        driver_chips = build_driver_chips(customer)
+        has_relationship_manager = safe_flag_state(customer.get("has_relationship_manager"))
+        credit_review_required = safe_flag_state(customer.get("credit_review_required"))
+        risk_explanation = (
+            f"This customer is marked {format_label(risk_label)} because the estimated leave probability is "
+            f"{format_percent(safe_numeric(customer.get('predicted_leave_probability')), 1)} and the priority score is "
+            f"{format_number(safe_numeric(customer.get('risk_adjusted_retention_score')), 2)}. "
+            f"Main warning signals: {', '.join(driver_chips)}."
+        )
+        payload[customer_id] = {
+            "customer_id": customer_id,
+            "risk_label": risk_label,
+            "risk_tone": risk_tone(risk_label),
+            "risk_explanation": risk_explanation,
+            "driver_chips": driver_chips,
+            "guidance": guidance,
+            "ai_context": build_customer_ai_context(customer),
+            "metrics": {
+                "Predicted leave probability": format_percent(safe_numeric(customer.get("predicted_leave_probability")), 1),
+                "Retention score": format_number(safe_numeric(customer.get("retention_score")), 2),
+                "Service quality index": format_number(safe_numeric(customer.get("service_quality_index")), 2),
+                "App rating": format_number(safe_numeric(customer.get("app_rating_score")), 1),
+                "Complaint count": format_number(safe_numeric(customer.get("complaint_count")), 0),
+                "Resolution days": format_number(safe_numeric(customer.get("resolution_days")), 1),
+                "Credit score": format_number(safe_numeric(customer.get("credit_score")), 0),
+                "Product count": format_number(safe_numeric(customer.get("product_count")), 0),
+                "Relationship manager": "Assigned" if has_relationship_manager is True else ("Not assigned" if has_relationship_manager is False else "NA"),
+                "Credit review required": "Yes" if credit_review_required is True else ("No" if credit_review_required is False else "NA"),
+            },
+            "summary": {
+                "Loan type": str(customer.get("loan_type", "NA")),
+                "Loan amount": format_currency(customer.get("loan_amount")),
+                "EMI": format_currency(customer.get("emi")),
+                "Income": format_currency(customer.get("income")),
+                "Customer value tier": str(customer.get("customer_value_tier", "NA")),
+                "Primary channel": str(customer.get("primary_channel", "NA")),
+                "Retention lane": str(customer.get("retention_strategy_lane", "NA")),
+                "Risk profile": str(customer.get("customer_risk_profile", "NA")),
+                "Action owner": str(customer.get("retention_action_owner", "NA")),
+                "Dashboard action": str(customer.get("recommended_action", "Review account")),
+            },
+        }
+    return json.dumps(payload).replace("</", "<\\/")
+
+
 def build_action_table(frame):
     if frame.empty:
         return '<div class="empty-state">No customers match the current filter.</div>'
@@ -554,20 +1262,15 @@ def build_action_table(frame):
     rows = []
     for _, row in frame.head(15).iterrows():
         risk_segment = str(row.get("leave_risk_segment", "NA"))
-        has_dedicated_banker = (
-            pd.to_numeric(row.get("has_relationship_manager"), errors="coerce") == 1
-        )
-        coverage_state = "assigned" if has_dedicated_banker else "unassigned"
-        coverage_text = "Yes" if has_dedicated_banker else "No"
-        approval_needed = (
-            "Yes"
-            if pd.to_numeric(row.get("credit_review_required"), errors="coerce") == 1
-            else "No"
-        )
+        relationship_manager_state = safe_flag_state(row.get("has_relationship_manager"))
+        credit_review_state = safe_flag_state(row.get("credit_review_required"))
+        coverage_state = "assigned" if relationship_manager_state is True else ("unassigned" if relationship_manager_state is False else "unknown")
+        coverage_text = "Yes" if relationship_manager_state is True else ("No" if relationship_manager_state is False else "NA")
+        approval_needed = "Yes" if credit_review_state is True else ("No" if credit_review_state is False else "NA")
         rows.append(
             f"""
             <tr>
-                <td data-label="Customer">{html.escape(str(row.get("customer_id", "NA")))}</td>
+                <td data-label="Customer"><button type="button" class="customer-link" data-customer-id="{html.escape(str(row.get("customer_id", "NA")))}">#{html.escape(str(row.get("customer_id", "NA")))}</button></td>
                 <td data-label="Attention Level"><span class="risk-pill risk-{html.escape(risk_tone(risk_segment))}">{html.escape(format_label(risk_segment))}</span></td>
                 <td data-label="Priority Score">{format_number(row.get("risk_adjusted_retention_score"), 2)}</td>
                 <td data-label="Chance Of Leaving">{format_percent(row.get("predicted_leave_probability"), 1)}</td>
@@ -598,6 +1301,186 @@ def build_action_table(frame):
         <tbody>{''.join(rows)}</tbody>
     </table>
     """
+
+
+def build_chatbot_panel(active_page, params, static_site=False):
+    current_scope = build_filter_summary(params)
+    if static_site:
+        status_text = (
+            "Decipher AI is available only in the live local dashboard because the static export does not "
+            "include the Gemini API endpoint."
+        )
+        availability_class = "assistant-status-warning"
+        disabled_attr = ' disabled="disabled"'
+    elif get_gemini_api_key():
+        status_text = f"Decipher AI is connected to Gemini via {get_gemini_model()} when you ask a question."
+        availability_class = "assistant-status-ready"
+        disabled_attr = ""
+    else:
+        status_text = (
+            "Gemini is not configured yet. Set GEMINI_API_KEY, restart the dashboard, and then test Decipher AI."
+        )
+        availability_class = "assistant-status-warning"
+        disabled_attr = ""
+
+    example_buttons_html = "".join(
+        f'<button class="prompt-chip" type="button" data-prompt="{html.escape(prompt)}"{disabled_attr}>{html.escape(prompt)}</button>'
+        for prompt in CHATBOT_EXAMPLE_PROMPTS
+    )
+
+    return f"""
+    <section class="panel dashboard-section dashboard-section-copilot" id="copilot">
+        <div class="panel-head">
+            <div>
+                <span class="panel-label">Decipher AI</span>
+                <h2>Ask the dashboard for grounded explanations</h2>
+                <p>Use Decipher AI to explain KPIs and charts, summarize risk patterns, identify urgent intervention cases, and suggest retention actions based on this project's actual findings.</p>
+            </div>
+            <div class="panel-note">Current chat scope: <strong>{html.escape(current_scope)}</strong></div>
+        </div>
+        <div class="assistant-layout" data-active-page="{html.escape(active_page)}">
+            <div class="assistant-intro">
+                <span class="section-tag">Decipher AI Scope</span>
+                <h3>What it knows</h3>
+                <p>The assistant is grounded in the dashboard summaries, KPI files, threshold analysis, feature importance, relationship-manager comparisons, retention framework, credit-risk guardrails, and the report’s executive summary.</p>
+                <div class="assistant-status {html.escape(availability_class)}">{html.escape(status_text)}</div>
+                <div class="prompt-chip-grid">
+                    {example_buttons_html}
+                </div>
+            </div>
+            <div class="assistant-console">
+                <div class="chat-log" id="chat-log">
+                    <article class="chat-message chat-message-assistant">
+                        <span class="chat-role">Decipher AI</span>
+                        <p>Ask a question about leave risk, key drivers, chart meaning, urgent customers, or retention actions. I will answer from the dashboard context and keep the response business-focused.</p>
+                    </article>
+                </div>
+                <form id="chat-form" class="chat-form" action="javascript:void(0)" method="post">
+                    <label class="chat-label" for="chat-input">Your question</label>
+                    <textarea id="chat-input" name="question" rows="4" placeholder="Example: Which customers need urgent intervention and why?"{disabled_attr}></textarea>
+                    <div class="chat-actions">
+                        <button class="button button-primary" id="chat-submit" type="button"{disabled_attr}>Ask Decipher AI</button>
+                        <span class="chat-help">Preferred answer format: Insight, Why it matters, Recommended action.</span>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </section>
+    """
+
+
+def build_loan_type_summary(final_df):
+    required_columns = {
+        "loan_type",
+        "customer_id",
+        "retention_score",
+        "predicted_leave_probability",
+        "service_quality_index",
+        "resolution_days",
+        "app_rating_score",
+        "has_relationship_manager",
+        "leave_risk_segment",
+    }
+    if final_df.empty or not required_columns.issubset(final_df.columns):
+        return pd.DataFrame()
+
+    summary_df = (
+        final_df.groupby("loan_type", dropna=False)
+        .agg(
+            customers=("customer_id", "count"),
+            avg_service_quality_index=("service_quality_index", "mean"),
+            avg_retention_score=("retention_score", "mean"),
+            avg_predicted_leave_probability=("predicted_leave_probability", "mean"),
+            avg_resolution_days=("resolution_days", "mean"),
+            avg_app_rating_score=("app_rating_score", "mean"),
+            relationship_manager_coverage=("has_relationship_manager", "mean"),
+            high_critical_risk_share=(
+                "leave_risk_segment",
+                lambda values: values.isin(["High", "Critical"]).mean(),
+            ),
+        )
+        .reset_index()
+        .sort_values("avg_predicted_leave_probability", ascending=False)
+    )
+    return summary_df
+
+
+def build_loan_type_story(loan_type_summary_df):
+    if loan_type_summary_df.empty:
+        return {
+            "highest_risk_loan_type": "Waiting for latest file",
+            "lowest_risk_loan_type": "Waiting for latest file",
+            "risk_gap": np.nan,
+            "highest_risk_share": np.nan,
+            "lowest_risk_share": np.nan,
+        }
+
+    highest_risk = loan_type_summary_df.iloc[0]
+    lowest_risk = loan_type_summary_df.iloc[-1]
+    return {
+        "highest_risk_loan_type": str(highest_risk["loan_type"]),
+        "lowest_risk_loan_type": str(lowest_risk["loan_type"]),
+        "risk_gap": float(
+            pd.to_numeric(
+                highest_risk["avg_predicted_leave_probability"], errors="coerce"
+            )
+            - pd.to_numeric(
+                lowest_risk["avg_predicted_leave_probability"], errors="coerce"
+            )
+        ),
+        "highest_risk_share": float(
+            pd.to_numeric(highest_risk["high_critical_risk_share"], errors="coerce")
+        ),
+        "lowest_risk_share": float(
+            pd.to_numeric(lowest_risk["high_critical_risk_share"], errors="coerce")
+        ),
+    }
+
+
+def build_loan_type_table(loan_type_summary_df):
+    if loan_type_summary_df.empty:
+        return '<div class="empty-state">Loan-type comparisons appear here after the latest export is generated.</div>'
+
+    display_df = loan_type_summary_df.copy()
+    display_df["Loan Type"] = display_df["loan_type"].apply(format_label)
+    display_df["Customers"] = display_df["customers"].apply(format_number)
+    display_df["Avg Leave Probability"] = display_df[
+        "avg_predicted_leave_probability"
+    ].apply(lambda value: format_percent(value, 1))
+    display_df["High And Critical Share"] = display_df[
+        "high_critical_risk_share"
+    ].apply(lambda value: format_percent(value, 1))
+    display_df["Avg Retention Score"] = display_df["avg_retention_score"].apply(
+        lambda value: format_number(value, 2)
+    )
+    display_df["Avg Service Quality"] = display_df[
+        "avg_service_quality_index"
+    ].apply(lambda value: format_percent(value, 1))
+    display_df["Avg Resolution Days"] = display_df["avg_resolution_days"].apply(
+        lambda value: format_number(value, 2)
+    )
+    display_df["Avg App Rating"] = display_df["avg_app_rating_score"].apply(
+        lambda value: format_number(value, 2)
+    )
+    display_df["RM Coverage"] = display_df["relationship_manager_coverage"].apply(
+        lambda value: format_percent(value, 1)
+    )
+
+    return dataframe_to_html(
+        display_df[
+            [
+                "Loan Type",
+                "Customers",
+                "Avg Leave Probability",
+                "High And Critical Share",
+                "Avg Retention Score",
+                "Avg Service Quality",
+                "Avg Resolution Days",
+                "Avg App Rating",
+                "RM Coverage",
+            ]
+        ]
+    )
 
 
 def get_threshold_record(df, feature_name):
@@ -847,6 +1730,7 @@ def build_dashboard_css():
     .page-drivers .dashboard-section-drivers,
     .page-charts .dashboard-section-charts,
     .page-actions .dashboard-section-actions,
+    .page-copilot .dashboard-section-copilot,
     .page-details .dashboard-section-details,
     .page-downloads .dashboard-section-downloads {
         display: block;
@@ -908,7 +1792,7 @@ def build_dashboard_css():
         background: rgba(20, 35, 45, 0.06);
         border-color: rgba(20, 35, 45, 0.08);
     }
-    .filters, .metric-grid, .signal-grid, .chart-grid, .support-grid {
+    .filters, .metric-grid, .signal-grid, .chart-grid, .support-grid, .prompt-chip-grid {
         display: grid;
         gap: 14px;
     }
@@ -917,6 +1801,7 @@ def build_dashboard_css():
     .signal-grid { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
     .chart-grid { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
     .support-grid { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+    .prompt-chip-grid { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); margin-top: 16px; }
     .summary-grid {
         display: grid;
         grid-template-columns: minmax(0, 1.5fr) minmax(300px, 0.9fr);
@@ -965,6 +1850,19 @@ def build_dashboard_css():
         background: linear-gradient(135deg, var(--primary), #1c6176);
     }
     .button-secondary { background: rgba(20, 35, 45, 0.07); color: var(--ink); }
+    .prompt-chip {
+        min-height: 52px;
+        padding: 12px 14px;
+        border-radius: 16px;
+        border: 1px solid rgba(15, 76, 92, 0.14);
+        background: rgba(15, 76, 92, 0.05);
+        color: var(--primary);
+        font: inherit;
+        font-size: 13px;
+        font-weight: 800;
+        text-align: left;
+        cursor: pointer;
+    }
     .metric-card, .signal-card, .table-card, .download-card, .chart-card, .summary-card {
         position: relative;
         overflow: hidden;
@@ -1037,10 +1935,157 @@ def build_dashboard_css():
         letter-spacing: 0.05em;
         text-transform: uppercase;
     }
+    .customer-link {
+        border: 0;
+        padding: 0;
+        background: transparent;
+        color: var(--primary);
+        cursor: pointer;
+        font: inherit;
+        font-weight: 900;
+        text-decoration: underline;
+        text-underline-offset: 3px;
+    }
+    .customer-link:hover, .customer-link:focus {
+        color: var(--secondary);
+        outline: none;
+    }
     .risk-critical, .coverage-unassigned { color: var(--alert); background: rgba(159, 47, 40, 0.14); }
     .risk-high { color: #9a4d08; background: rgba(217, 108, 6, 0.14); }
-    .risk-moderate { color: #80610c; background: rgba(207, 170, 70, 0.18); }
+    .risk-moderate, .coverage-unknown { color: #80610c; background: rgba(207, 170, 70, 0.18); }
     .risk-low, .coverage-assigned { color: #426645; background: rgba(108, 138, 93, 0.14); }
+    .customer-modal {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 22px;
+        background: rgba(10, 22, 28, 0.58);
+        backdrop-filter: blur(7px);
+    }
+    .customer-modal.open { display: flex; }
+    .customer-modal-card {
+        width: min(1120px, 100%);
+        max-height: min(90vh, 920px);
+        overflow: auto;
+        border-radius: 26px;
+        border: 1px solid rgba(255,255,255,0.42);
+        background:
+            radial-gradient(circle at top right, rgba(217, 108, 6, 0.10), transparent 30%),
+            linear-gradient(180deg, #fffdf8, #f8efe3);
+        box-shadow: 0 34px 90px rgba(10, 22, 28, 0.35);
+    }
+    .customer-modal-head {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        display: flex;
+        justify-content: space-between;
+        gap: 18px;
+        padding: 22px;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 252, 247, 0.96);
+    }
+    .customer-modal-head h2 {
+        margin: 6px 0 0;
+        font-family: var(--display-font);
+        font-size: clamp(2rem, 4vw, 3rem);
+        letter-spacing: -0.04em;
+    }
+    .modal-close {
+        align-self: flex-start;
+        min-height: 42px;
+        border: 0;
+        border-radius: 999px;
+        padding: 10px 15px;
+        background: rgba(20, 35, 45, 0.08);
+        color: var(--ink);
+        cursor: pointer;
+        font: inherit;
+        font-weight: 900;
+    }
+    .customer-modal-body {
+        display: grid;
+        grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.15fr);
+        gap: 16px;
+        padding: 18px 22px 24px;
+    }
+    .customer-360-section {
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        padding: 16px;
+        background: rgba(255,255,255,0.78);
+    }
+    .customer-360-section h3 {
+        margin: 0 0 10px;
+        font-family: var(--display-font);
+        font-size: 24px;
+        letter-spacing: -0.03em;
+    }
+    .customer-360-section p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.6;
+        font-size: 14px;
+    }
+    .customer-360-full { grid-column: 1 / -1; }
+    .customer-360-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+    }
+    .customer-360-stat {
+        padding: 12px;
+        border-radius: 15px;
+        background: rgba(15, 76, 92, 0.055);
+        border: 1px solid rgba(15, 76, 92, 0.08);
+    }
+    .customer-360-stat span {
+        display: block;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+    }
+    .customer-360-stat strong {
+        display: block;
+        margin-top: 6px;
+        font-size: 16px;
+        color: var(--ink);
+    }
+    .driver-chip-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+    .driver-chip {
+        display: inline-flex;
+        align-items: center;
+        min-height: 32px;
+        padding: 7px 10px;
+        border-radius: 999px;
+        color: var(--primary);
+        background: rgba(15, 76, 92, 0.08);
+        border: 1px solid rgba(15, 76, 92, 0.10);
+        font-size: 12px;
+        font-weight: 850;
+    }
+    .customer-360-list {
+        margin: 0;
+        padding-left: 18px;
+        color: var(--muted);
+        line-height: 1.55;
+        font-size: 14px;
+    }
+    .customer-360-list li + li { margin-top: 8px; }
+    .risk-modal-badge {
+        display: inline-flex;
+        width: fit-content;
+        margin-top: 10px;
+    }
     .download-grid { gap: 14px; }
     .download-card { flex: 1 1 240px; min-width: 240px; }
     .empty-state {
@@ -1050,6 +2095,129 @@ def build_dashboard_css():
         background: rgba(255,255,255,0.58);
         color: var(--muted);
     }
+    .assistant-layout {
+        display: grid;
+        grid-template-columns: minmax(280px, 0.9fr) minmax(0, 1.3fr);
+        gap: 18px;
+        align-items: start;
+    }
+    .assistant-intro, .assistant-console {
+        border-radius: 22px;
+        border: 1px solid var(--line);
+        background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(245, 239, 227, 0.9));
+        padding: 18px;
+    }
+    .assistant-intro h3 {
+        margin: 8px 0 0;
+        font-size: 28px;
+        font-family: var(--display-font);
+    }
+    .assistant-status {
+        margin-top: 14px;
+        padding: 12px 14px;
+        border-radius: 16px;
+        font-size: 13px;
+        line-height: 1.55;
+        font-weight: 700;
+    }
+    .assistant-status-ready {
+        color: #215f37;
+        background: rgba(108, 138, 93, 0.14);
+        border: 1px solid rgba(108, 138, 93, 0.2);
+    }
+    .assistant-status-warning {
+        color: #77431a;
+        background: #fff4e7;
+        border: 1px solid rgba(217, 108, 6, 0.18);
+    }
+    .chat-log {
+        min-height: 380px;
+        overflow: visible;
+        padding-right: 4px;
+    }
+    .chat-message {
+        margin-bottom: 14px;
+        padding: 14px 16px;
+        border-radius: 18px;
+        border: 1px solid var(--line);
+        overflow: visible;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        line-height: 1.6;
+        font-size: 14px;
+    }
+    .chat-message p {
+        margin: 8px 0 0;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+    }
+    .chat-message .chat-section-title {
+        display: block;
+        margin-top: 12px;
+        color: var(--primary);
+        font-weight: 900;
+    }
+    .chat-message .chat-section-title:first-of-type { margin-top: 8px; }
+    .chat-message ul {
+        margin: 8px 0 0;
+        padding-left: 20px;
+        color: var(--ink);
+        line-height: 1.6;
+    }
+    .chat-message li + li { margin-top: 5px; }
+    .chat-message-user {
+        background: rgba(15, 76, 92, 0.07);
+        margin-left: 42px;
+    }
+    .chat-message-assistant {
+        background: rgba(255,255,255,0.96);
+        margin-right: 42px;
+    }
+    .chat-message-system {
+        background: rgba(217, 108, 6, 0.08);
+        border-style: dashed;
+    }
+    .chat-role {
+        display: block;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        font-size: 11px;
+        font-weight: 800;
+        color: var(--muted);
+    }
+    .chat-form { margin-top: 16px; }
+    .chat-label {
+        display: block;
+        margin-bottom: 8px;
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        font-weight: 700;
+    }
+    .chat-form textarea {
+        width: 100%;
+        resize: vertical;
+        min-height: 128px;
+        padding: 14px;
+        border-radius: 16px;
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.98);
+        color: var(--ink);
+        font: inherit;
+    }
+    .chat-actions {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin-top: 12px;
+    }
+    .chat-help {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+    }
     code {
         padding: 2px 6px;
         border-radius: 8px;
@@ -1057,7 +2225,8 @@ def build_dashboard_css():
         font-family: Consolas, "Courier New", monospace;
     }
     @media (max-width: 1100px) {
-        .hero, .summary-grid { grid-template-columns: 1fr; }
+        .hero, .summary-grid, .assistant-layout, .customer-modal-body { grid-template-columns: 1fr; }
+        .customer-360-full { grid-column: auto; }
         .toolbar { position: static; }
     }
     @media (max-width: 760px) {
@@ -1067,6 +2236,13 @@ def build_dashboard_css():
         .spotlight-grid { grid-template-columns: 1fr; }
         .filter-actions { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; }
         .button, .download-link { width: 100%; }
+        .chat-actions { align-items: stretch; flex-direction: column; }
+        .chat-message-user, .chat-message-assistant { margin-left: 0; margin-right: 0; }
+        .customer-modal { padding: 10px; align-items: stretch; }
+        .customer-modal-card { max-height: 96vh; }
+        .customer-modal-head { flex-direction: column; padding: 16px; }
+        .customer-modal-body { padding: 14px; }
+        .customer-360-grid { grid-template-columns: 1fr; }
         .action-table thead { display: none; }
         .action-table, .action-table tbody, .action-table tr, .action-table td {
             display: block;
@@ -1139,6 +2315,15 @@ def build_dashboard_css():
         transform: translateY(-2px);
         box-shadow: 0 6px 14px rgba(20, 35, 45, 0.10);
     }
+    .prompt-chip:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 10px 24px rgba(15, 76, 92, 0.12);
+        background: rgba(15, 76, 92, 0.08);
+    }
+    .prompt-chip:disabled, .chat-form textarea:disabled, .button:disabled {
+        cursor: not-allowed;
+        opacity: 0.65;
+    }
     .jump-link { transition: background 0.18s ease, transform 0.18s ease; }
     .jump-link:hover { background: rgba(255,255,255,0.22); transform: translateY(-2px); }
     .spotlight-card { transition: background 0.20s ease, transform 0.20s ease; }
@@ -1186,6 +2371,9 @@ def build_dashboard_css():
 def build_dashboard_js():
     return """
 (function(){
+    var chatHistory = [];
+    var CHAT_STORAGE_KEY = 'retailBankingDecipherAIHistory';
+
     function countUp(el){
         if(el.dataset.counted) return;
         el.dataset.counted='1';
@@ -1234,9 +2422,271 @@ def build_dashboard_js():
             io.observe(p);
         });
     }
+    function escapeHtml(text){
+        return String(text)
+            .replace(/&/g,'&amp;')
+            .replace(/</g,'&lt;')
+            .replace(/>/g,'&gt;')
+            .replace(/\"/g,'&quot;')
+            .replace(/'/g,'&#39;');
+    }
+    function formatChatContent(content){
+        var lines=String(content || '').replace(/\\r\\n/g,'\\n').split('\\n');
+        var html='';
+        var listOpen=false;
+        function closeList(){
+            if(listOpen){
+                html+='</ul>';
+                listOpen=false;
+            }
+        }
+        lines.forEach(function(rawLine){
+            var line=rawLine.trim();
+            if(!line){
+                closeList();
+                return;
+            }
+            if(/^(Insight|Why it matters|Recommended action|Suggested approach|What to say|What to offer|What to avoid):$/i.test(line)){
+                closeList();
+                html+='<span class=\"chat-section-title\">'+escapeHtml(line)+'</span>';
+                return;
+            }
+            if(/^[-*]\\s+/.test(line)){
+                if(!listOpen){
+                    html+='<ul>';
+                    listOpen=true;
+                }
+                html+='<li>'+escapeHtml(line.replace(/^[-*]\\s+/,''))+'</li>';
+                return;
+            }
+            closeList();
+            html+='<p>'+escapeHtml(line)+'</p>';
+        });
+        closeList();
+        return html || '<p>NA</p>';
+    }
+    function renderMessage(role, content){
+        var log=document.getElementById('chat-log');
+        if(!log) return;
+        var article=document.createElement('article');
+        article.className='chat-message chat-message-'+role;
+        var label=role==='user' ? 'You' : (role==='assistant' ? 'Decipher AI' : 'System');
+        article.innerHTML='<span class=\"chat-role\">'+escapeHtml(label)+'</span>'+formatChatContent(content);
+        log.appendChild(article);
+        log.scrollTop=log.scrollHeight;
+    }
+    function saveChatHistory(){
+        try{
+            window.sessionStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(chatHistory.slice(-12)));
+        }catch(err){}
+    }
+    function restoreChatHistory(){
+        var log=document.getElementById('chat-log');
+        if(!log || !window.sessionStorage) return;
+        try{
+            var saved=JSON.parse(window.sessionStorage.getItem(CHAT_STORAGE_KEY) || '[]');
+            if(!Array.isArray(saved) || !saved.length) return;
+            chatHistory=saved.filter(function(item){
+                return item && (item.role==='user' || item.role==='assistant' || item.role==='system') && item.content;
+            }).slice(-12);
+            if(!chatHistory.length) return;
+            log.innerHTML='';
+            chatHistory.forEach(function(item){
+                renderMessage(item.role,item.content);
+            });
+        }catch(err){}
+    }
+    function setSubmitting(isSubmitting){
+        var form=document.getElementById('chat-form');
+        if(!form) return;
+        var button=document.getElementById('chat-submit');
+        var textarea=document.getElementById('chat-input');
+        if(button){
+            button.disabled=isSubmitting || button.hasAttribute('data-hard-disabled');
+            button.textContent=isSubmitting ? 'Thinking...' : 'Ask Decipher AI';
+        }
+        if(textarea && !textarea.hasAttribute('data-hard-disabled')){
+            textarea.disabled=isSubmitting;
+        }
+    }
+    function extractFilters(){
+        var params={};
+        var search=new URLSearchParams(window.location.search);
+        search.forEach(function(value,key){ params[key]=value; });
+        return params;
+    }
+    function submitQuestion(question){
+        if(!question) return;
+        renderMessage('user',question);
+        chatHistory.push({role:'user',content:question});
+        saveChatHistory();
+        setSubmitting(true);
+        fetch('/api/chat',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                question:question,
+                history:chatHistory.slice(-6),
+                params:extractFilters(),
+                path:window.location.pathname
+            })
+        }).then(function(response){
+            return response.json().catch(function(){ return {}; }).then(function(payload){
+                return {ok:response.ok,payload:payload};
+            });
+        }).then(function(result){
+            var message=result.payload && result.payload.message ? result.payload.message : 'Decipher AI did not return a response.';
+            var role=result.ok ? 'assistant' : 'system';
+            renderMessage(role,message);
+            if(result.ok){
+                chatHistory.push({role:'assistant',content:message});
+            }else{
+                chatHistory.push({role:'system',content:message});
+            }
+            saveChatHistory();
+        }).catch(function(){
+            var message='Decipher AI could not be reached from the dashboard. Please try again.';
+            renderMessage('system',message);
+            chatHistory.push({role:'system',content:message});
+            saveChatHistory();
+        }).finally(function(){
+            setSubmitting(false);
+        });
+    }
+    function setupChatbot(){
+        var form=document.getElementById('chat-form');
+        var textarea=document.getElementById('chat-input');
+        if(!form || !textarea) return;
+        if(textarea.disabled){
+            textarea.setAttribute('data-hard-disabled','1');
+        }
+        var submitButton=document.getElementById('chat-submit');
+        if(submitButton && submitButton.disabled){
+            submitButton.setAttribute('data-hard-disabled','1');
+        }
+        function handleChatSubmit(event){
+            if(event){
+                event.preventDefault();
+            }
+            var question=textarea.value.trim();
+            if(!question) return;
+            textarea.value='';
+            submitQuestion(question);
+        }
+        form.addEventListener('submit',handleChatSubmit);
+        if(submitButton){
+            submitButton.addEventListener('click',handleChatSubmit);
+        }
+        document.querySelectorAll('.prompt-chip').forEach(function(button){
+            button.addEventListener('click',function(){
+                var prompt=button.getAttribute('data-prompt') || '';
+                if(!prompt) return;
+                textarea.value=prompt;
+                textarea.focus();
+            });
+        });
+    }
+    function parseCustomer360Data(){
+        var dataNode=document.getElementById('customer-360-data');
+        if(!dataNode) return {};
+        try{
+            return JSON.parse(dataNode.textContent || '{}');
+        }catch(err){
+            return {};
+        }
+    }
+    function renderKeyValueGrid(id, values){
+        var host=document.getElementById(id);
+        if(!host) return;
+        var html='';
+        Object.keys(values || {}).forEach(function(label){
+            html+='<div class=\"customer-360-stat\"><span>'+escapeHtml(label)+'</span><strong>'+escapeHtml(values[label] || 'NA')+'</strong></div>';
+        });
+        host.innerHTML=html || '<div class=\"empty-state\">No details available.</div>';
+    }
+    function renderCustomerList(id, items){
+        var host=document.getElementById(id);
+        if(!host) return;
+        if(!items || !items.length){
+            host.innerHTML='<li>NA</li>';
+            return;
+        }
+        host.innerHTML=items.map(function(item){ return '<li>'+escapeHtml(item)+'</li>'; }).join('');
+    }
+    function renderDriverChips(items){
+        var host=document.getElementById('customer-360-drivers');
+        if(!host) return;
+        if(!items || !items.length){
+            host.innerHTML='<span class=\"driver-chip\">Review relationship</span>';
+            return;
+        }
+        host.innerHTML=items.map(function(item){ return '<span class=\"driver-chip\">'+escapeHtml(item)+'</span>'; }).join('');
+    }
+    function setupCustomer360(){
+        var modal=document.getElementById('customer-360-modal');
+        var closeButton=document.getElementById('customer-360-close');
+        var customerData=parseCustomer360Data();
+        if(!modal) return;
+
+        function setText(id, value){
+            var el=document.getElementById(id);
+            if(el) el.textContent=value || 'NA';
+        }
+        function openCustomer(customerId){
+            var customer=customerData[String(customerId)];
+            if(!customer){
+                return;
+            }
+            setText('customer-360-title','Customer #'+customer.customer_id);
+            setText('customer-360-risk-copy',customer.risk_explanation);
+            var badge=document.getElementById('customer-360-risk-badge');
+            if(badge){
+                badge.className='risk-pill risk-modal-badge risk-'+(customer.risk_tone || 'neutral');
+                badge.textContent=customer.risk_label || 'NA';
+            }
+            renderKeyValueGrid('customer-360-summary',customer.summary);
+            renderKeyValueGrid('customer-360-metrics',customer.metrics);
+            renderDriverChips(customer.driver_chips);
+            renderCustomerList('customer-360-next-steps',customer.guidance && customer.guidance.focus_points);
+            renderCustomerList('customer-360-safe-offers',customer.guidance && customer.guidance.safe_offers);
+            renderCustomerList('customer-360-avoid-offers',customer.guidance && customer.guidance.avoid_offers);
+            modal.classList.add('open');
+            modal.setAttribute('aria-hidden','false');
+            document.body.style.overflow='hidden';
+            if(closeButton) closeButton.focus();
+        }
+        function closeCustomer(){
+            modal.classList.remove('open');
+            modal.setAttribute('aria-hidden','true');
+            document.body.style.overflow='';
+        }
+
+        document.querySelectorAll('.customer-link').forEach(function(button){
+            button.addEventListener('click',function(event){
+                event.preventDefault();
+                openCustomer(button.getAttribute('data-customer-id'));
+            });
+        });
+        if(closeButton){
+            closeButton.addEventListener('click',closeCustomer);
+        }
+        modal.addEventListener('click',function(event){
+            if(event.target===modal){
+                closeCustomer();
+            }
+        });
+        document.addEventListener('keydown',function(event){
+            if(event.key==='Escape' && modal.classList.contains('open')){
+                closeCustomer();
+            }
+        });
+    }
     document.addEventListener('DOMContentLoaded',function(){
         document.querySelectorAll('.spotlight-value').forEach(countUp);
         revealOnScroll();
+        restoreChatHistory();
+        setupChatbot();
+        setupCustomer360();
     });
 })();
 """
@@ -1279,6 +2729,9 @@ def build_dashboard_html(params, active_page="overview", static_site=False):
         refresh_seconds = max(5, int(params.get("refresh", ["300"])[0]))
     except (TypeError, ValueError):
         refresh_seconds = 300
+    refresh_meta_tag = (
+        "" if active_page == "copilot" else f'<meta http-equiv="refresh" content="{refresh_seconds}">'
+    )
 
     data = load_data()
     final_df = ensure_dashboard_columns(data["final"])
@@ -1304,11 +2757,11 @@ def build_dashboard_html(params, active_page="overview", static_site=False):
     credit_risk_integration_df = data["credit_risk_integration"].copy()
     correlations_df = data["correlations"].copy()
     feature_importance_df = data["feature_importance"].copy()
+    loan_type_summary_df = build_loan_type_summary(final_df)
+    loan_type_story = build_loan_type_story(loan_type_summary_df)
 
-    top_customers = filtered_df.sort_values(
-        ["risk_adjusted_retention_score", "predicted_leave_probability", "clv"],
-        ascending=[False, False, False],
-    )
+    top_customers = sort_priority_customers(filtered_df)
+    customer_360_payload = build_customer_360_payload(top_customers)
 
     strongest_dimension_label = format_label(metrics["strongest_servqual_dimension"])
     weakest_dimension_label = format_label(portfolio_summary["weakest_dimension"])
@@ -1371,10 +2824,30 @@ def build_dashboard_html(params, active_page="overview", static_site=False):
             "This service area lines up most closely with stronger loyalty scores."
         )
 
+    loan_type_risk_metric = "Waiting for latest file"
+    loan_type_risk_detail = "Loan-type comparisons appear when the latest export is available."
+    if not loan_type_summary_df.empty:
+        loan_type_risk_metric = format_label(loan_type_story["highest_risk_loan_type"])
+        loan_type_risk_detail = (
+            f"This loan portfolio has the highest average leave probability at "
+            f"{format_percent(loan_type_summary_df.iloc[0]['avg_predicted_leave_probability'], 1)}. "
+            "It is a segment where service friction appears to matter more."
+        )
+
+    loan_type_gap_metric = "Waiting for latest file"
+    loan_type_gap_detail = "Run the latest export to compare higher-risk and lower-risk loan portfolios."
+    if not loan_type_summary_df.empty:
+        loan_type_gap_metric = format_percent(loan_type_story["risk_gap"], 1)
+        loan_type_gap_detail = (
+            f"{format_label(loan_type_story['highest_risk_loan_type'])} loans show a much higher average leave probability "
+            f"than {format_label(loan_type_story['lowest_risk_loan_type'])} loans in this portfolio."
+        )
+
     chart_cards_html = "".join(
         build_chart_card(chart_config, cache_key, static_site)
         for chart_config in CHART_CONFIG
     )
+    chatbot_panel_html = build_chatbot_panel(active_page, params, static_site)
     retention_kpi_cards_html = build_retention_kpi_cards(retention_kpi_df)
     download_files = PUBLIC_DOWNLOAD_FILES if static_site else DOWNLOAD_FILES
     download_cards_html = "".join(
@@ -1432,6 +2905,14 @@ def build_dashboard_html(params, active_page="overview", static_site=False):
             f"""
             <article class="table-card">
                 <span class="section-tag">Optional Details</span>
+                <h3>Loan type and retention</h3>
+                <p>Compares leave risk, retention strength, service quality, and relationship coverage across loan portfolios.</p>
+                <div class="table-wrap">{build_loan_type_table(loan_type_summary_df)}</div>
+            </article>
+            """,
+            f"""
+            <article class="table-card">
+                <span class="section-tag">Optional Details</span>
                 <h3>What the estimate relies on</h3>
                 <p>Shows which inputs matter most in the estimate.</p>
                 <div class="table-wrap">{dataframe_to_html(feature_importance_df.head(10))}</div>
@@ -1444,7 +2925,7 @@ def build_dashboard_html(params, active_page="overview", static_site=False):
     <html>
     <head>
         <meta charset="utf-8">
-        <meta http-equiv="refresh" content="{refresh_seconds}">
+        {refresh_meta_tag}
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Retail Banking Customer Dashboard</title>
         <style>{build_dashboard_css()}</style>
@@ -1581,7 +3062,17 @@ def build_dashboard_html(params, active_page="overview", static_site=False):
                     {build_signal_card("App rating warning", app_metric, app_detail, "high")}
                     {build_signal_card("Dedicated banker effect", rm_metric, rm_detail, "low")}
                     {build_signal_card("Best link to loyalty", correlation_metric, correlation_detail, "low")}
+                    {build_signal_card("Loan type under most pressure", loan_type_risk_metric, loan_type_risk_detail, "high")}
+                    {build_signal_card("Loan type risk gap", loan_type_gap_metric, loan_type_gap_detail, "high")}
                     {build_signal_card("Weakest area in this view", weakest_dimension_label, "This is the lowest average service score in the current filter, so it is the clearest weakness to fix first.", "critical")}
+                </div>
+                <div class="support-grid" style="margin-top: 14px;">
+                    <article class="table-card">
+                        <span class="section-tag">Loan Type View</span>
+                        <h3>How product segments link with retention</h3>
+                        <p><strong>{html.escape(format_label(loan_type_story['highest_risk_loan_type']))}</strong> loans currently show the highest average leave probability, while <strong>{html.escape(format_label(loan_type_story['lowest_risk_loan_type']))}</strong> loans show the lowest. This suggests loan type works mainly as a portfolio segment indicator of where service friction and follow-up pressure are concentrated.</p>
+                        <div class="table-wrap">{build_loan_type_table(loan_type_summary_df)}</div>
+                    </article>
                 </div>
             </section>
 
@@ -1614,6 +3105,8 @@ def build_dashboard_html(params, active_page="overview", static_site=False):
                 <div class="table-wrap">{build_action_table(top_customers)}</div>
             </section>
 
+            {chatbot_panel_html}
+
             <section class="panel dashboard-section dashboard-section-details" id="details">
                 <div class="panel-head">
                     <div>
@@ -1636,6 +3129,46 @@ def build_dashboard_html(params, active_page="overview", static_site=False):
                 <div class="download-grid">{download_cards_html}</div>
             </section>
         </div>
+        <div class="customer-modal" id="customer-360-modal" aria-hidden="true">
+            <section class="customer-modal-card" role="dialog" aria-modal="true" aria-labelledby="customer-360-title">
+                <div class="customer-modal-head">
+                    <div>
+                        <span class="panel-label">Customer 360 Review</span>
+                        <h2 id="customer-360-title">Customer</h2>
+                        <span id="customer-360-risk-badge" class="risk-pill risk-modal-badge">NA</span>
+                    </div>
+                    <button type="button" class="modal-close" id="customer-360-close">Close</button>
+                </div>
+                <div class="customer-modal-body">
+                    <article class="customer-360-section">
+                        <h3>Customer Summary</h3>
+                        <div class="customer-360-grid" id="customer-360-summary"></div>
+                    </article>
+                    <article class="customer-360-section">
+                        <h3>Risk Explanation</h3>
+                        <p id="customer-360-risk-copy">Select a Customer ID to view details.</p>
+                        <div class="customer-360-grid" id="customer-360-metrics" style="margin-top: 12px;"></div>
+                    </article>
+                    <article class="customer-360-section customer-360-full">
+                        <h3>Key Drivers / Warning Signals</h3>
+                        <div class="driver-chip-row" id="customer-360-drivers"></div>
+                    </article>
+                    <article class="customer-360-section">
+                        <h3>RM Next Steps</h3>
+                        <ul class="customer-360-list" id="customer-360-next-steps"></ul>
+                    </article>
+                    <article class="customer-360-section">
+                        <h3>Recommended Offers / Support</h3>
+                        <ul class="customer-360-list" id="customer-360-safe-offers"></ul>
+                    </article>
+                    <article class="customer-360-section customer-360-full">
+                        <h3>Offers To Avoid</h3>
+                        <ul class="customer-360-list" id="customer-360-avoid-offers"></ul>
+                    </article>
+                </div>
+            </section>
+        </div>
+        <script id="customer-360-data" type="application/json">{customer_360_payload}</script>
         <script>{build_dashboard_js()}</script>
     </body>
     </html>
@@ -1643,6 +3176,87 @@ def build_dashboard_html(params, active_page="overview", static_site=False):
 
 
 class DashboardHandler(SimpleHTTPRequestHandler):
+    def _send_json(self, status, payload):
+        response_bytes = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(response_bytes)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(response_bytes)
+
+    def _handle_chat_request(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/chat":
+            self.send_error(HTTPStatus.NOT_FOUND, "This API route is not available.")
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = 0
+        if content_length <= 0:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"message": "Please enter a question for Decipher AI."},
+            )
+            return
+
+        try:
+            request_payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except json.JSONDecodeError:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"message": "The dashboard sent an invalid chat request."},
+            )
+            return
+
+        question = str(request_payload.get("question", "")).strip()
+        if not question:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"message": "Please enter a question for Decipher AI."},
+            )
+            return
+
+        raw_params = request_payload.get("params") or {}
+        normalized_params = {}
+        if isinstance(raw_params, dict):
+            for key, value in raw_params.items():
+                if isinstance(value, list):
+                    normalized_params[key] = [str(item) for item in value]
+                else:
+                    normalized_params[key] = [str(value)]
+
+        page_path = str(request_payload.get("path", "/"))
+        active_page = PAGE_ROUTES.get(page_path, "overview")
+        data = load_data()
+        final_df = ensure_dashboard_columns(data["final"])
+        metrics_df = data["metrics"]
+        if final_df.empty or metrics_df.empty:
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "message": (
+                        "Decipher AI cannot answer yet because the latest dashboard outputs are missing. "
+                        "Run python retail_banking_analysis.py first."
+                    )
+                },
+            )
+            return
+
+        filtered_df = filter_dataframe(final_df, normalized_params)
+        dashboard_context = build_dashboard_context(
+            data, filtered_df, normalized_params, active_page
+        )
+        result = ask_gemini_dashboard_assistant(
+            question,
+            dashboard_context,
+            history=request_payload.get("history"),
+        )
+        status = result.pop("status", HTTPStatus.OK)
+        self._send_json(status, result)
+
     def _handle_request(self, include_body):
         parsed = urlparse(self.path)
         active_page = PAGE_ROUTES.get(parsed.path)
@@ -1689,6 +3303,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     def do_HEAD(self):
         self._handle_request(include_body=False)
+
+    def do_POST(self):
+        self._handle_chat_request()
 
 
 def copy_static_asset(source_path, destination_path):
