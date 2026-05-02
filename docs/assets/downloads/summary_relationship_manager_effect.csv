@@ -1,0 +1,3 @@
+relationship_manager_status,customer_count,avg_retention_score,avg_service_quality_index,avg_predicted_leave_probability,likely_to_leave_rate,retention_rate_proxy
+Has Relationship Manager,6024,76.982,0.6599,0.2264,0.1828,0.8172
+No Relationship Manager,13976,74.6121,0.4417,0.3463,0.279,0.721

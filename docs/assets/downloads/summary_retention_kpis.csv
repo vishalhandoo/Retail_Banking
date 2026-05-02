@@ -1,0 +1,13 @@
+metric_group,metric_name,metric_label,metric_value,unit,benchmark_rule,interpretation
+Portfolio Stability,retention_rate,Retention Proxy Rate,0.75,rate,1 - bottom-quartile leave-risk proxy rate,Higher values indicate a larger share of customers outside the modeled leave-risk target.
+Portfolio Stability,high_critical_risk_share,High And Critical Risk Share,0.2001,rate,"leave_risk_segment in {High, Critical}",Share of the portfolio that needs more active retention monitoring.
+Retention Framework,proactive_retention_share,Proactive Retention Share,0.6989,rate,retention_strategy_lane = Proactive Retention,Share of customers currently managed through early-warning or lifecycle retention activity.
+Retention Framework,reactive_retention_share,Reactive Retention Share,0.3011,rate,retention_strategy_lane = Reactive Retention,Share of customers already showing signals strong enough to require direct intervention.
+Retention Framework,priority_retention_share,Immediate And Priority RARS Share,0.2,rate,"rars_priority_segment in {Immediate Retention Priority, Priority Retention}",Customers whose leave propensity and credit profile make them the highest-value retention queue.
+Credit Risk Integration,credit_review_required_rate,Credit Review Required Share,0.4432,rate,credit_review_required = 1,Customers whose retention actions need explicit credit-risk review or tighter guardrails.
+Relationship Coverage,relationship_manager_coverage_rate,Relationship Manager Coverage,0.3012,rate,has_relationship_manager = 1,Share of customers supported by a dedicated relationship layer.
+Channel Mix,digital_primary_channel_rate,Digital Primary Channel Rate,0.8016,rate,"primary_channel in {Mobile, Web}",Share of customers whose primary interaction channel is digital.
+Service Health,resolution_within_threshold_rate,Resolution Within Threshold Rate,0.7127,rate,resolution_days <= 6.5,Share of customers whose issue-resolution experience stays inside the modeled risk threshold.
+Service Health,app_rating_above_threshold_rate,App Rating Above Threshold Rate,0.7909,rate,app_rating_score > 3.5,Share of customers whose app experience remains above the modeled digital-risk threshold.
+Relationship Depth,average_product_count,Average Products Per Customer,4.5061,count,mean(product_count),Higher product depth usually signals a more embedded banking relationship.
+Relationship Depth,five_plus_products_rate,Five Plus Products Rate,0.3786,rate,product_count >= 5,Share of customers with deeper cross-held relationships across the bank.
